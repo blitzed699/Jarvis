@@ -19,7 +19,7 @@ DESTRUCTIVE_PATTERNS = [
     r'\bmv\s+/.*\s+/dev/null\b',
 ]
 
-DESTRUCTIVE_TOOL_NAMES = {"shell", "write_file", "run_python"}
+DESTRUCTIVE_TOOL_NAMES = {"shell", "write_file", "run_python", "organize_files"}
 
 
 READONLY_TOOL_NAMES = {"file_read", "file_list"}
