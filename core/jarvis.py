@@ -5,6 +5,7 @@ from .memory import JARVISMemory
 from .llm import OllamaClient
 from .router import ToolRouter
 from .extractor import FactExtractor
+from .safety import SafetyGate
 import importlib
 import os
 
@@ -26,6 +27,7 @@ class JARVISCore:
         self.tools = self._load_tools()
         self.router = ToolRouter(self.tools)
         self.extractor = FactExtractor(self.llm)
+        self.safety = SafetyGate()
     
     def _load_tools(self) -> Dict[str, Any]:
         """Dynamically load all tools from tools/ directory."""
@@ -73,24 +75,52 @@ JARVIS:"""
             if facts:
                 print(f"  [Memory: stored {len(facts)} fact(s)]")
         except Exception:
-            pass  # Extraction is a bonus, never block the main flow
+            pass
+    
+    def _execute_with_safety(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute tool with safety approval gate."""
+        tool_name = tool_call.get("tool")
+        params = tool_call.get("params", {})
+        
+        is_approved, reason = self.safety.check_tool_call(tool_name, params)
+        
+        if not is_approved:
+            approved = self.safety.request_approval(tool_name, params, reason)
+            if not approved:
+                return {"success": False, "result": "User denied approval for this action."}
+        
+        # Approved or auto-approved — execute
+        return self.router.execute(tool_call)
     
     def process(self, user_input: str) -> str:
         """Main entry point. Process user input and return response."""
         prompt = self._build_prompt(user_input)
         raw_response = self.llm.generate(prompt, system=JARVIS_PERSONA)
         
-        # Use router to handle tool calls
-        tool_result, used_tool = self.router.handle_tool_use(
-            user_input, raw_response, self.memory
-        )
+        # Use router to detect tool calls
+        is_tool, tool_call = self.router.parse_response(raw_response)
         
-        if used_tool:
-            # Build follow-up prompt with tool result
+        if is_tool:
+            # Log pending tool call
+            self.memory.log_message(
+                "user", user_input,
+                tool_call=tool_call["tool"],
+                tool_result="[PENDING]"
+            )
+            
+            # Execute with safety
+            result = self._execute_with_safety(tool_call)
+            
+            if result.get("success"):
+                result_str = json.dumps(result.get("result"), indent=2)
+            else:
+                result_str = f"[ERROR] {result.get('result')}"
+            
+            # Build follow-up prompt
             follow_up_prompt = f"""{JARVIS_PERSONA}
 
-You just used a tool and received this result:
-{tool_result}
+You just used the tool '{tool_call['tool']}' with result:
+{result_str}
 
 Respond to the user naturally based on this result. Be concise.
 
@@ -98,7 +128,7 @@ User: {user_input}
 JARVIS:"""
             
             final_response = self.llm.generate(follow_up_prompt, system=JARVIS_PERSONA)
-            self.memory.log_message("jarvis", final_response, tool_call="[routed]")
+            self.memory.log_message("jarvis", final_response, tool_call=tool_call["tool"])
             self._extract_facts(user_input, final_response)
             return final_response
         else:
