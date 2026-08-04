@@ -1,9 +1,10 @@
 import json
 import sys
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from .memory import JARVISMemory
 from .llm import OllamaClient
 from .router import ToolRouter
+from .extractor import FactExtractor
 import importlib
 import os
 
@@ -24,6 +25,7 @@ class JARVISCore:
         self.llm = OllamaClient(model=model)
         self.tools = self._load_tools()
         self.router = ToolRouter(self.tools)
+        self.extractor = FactExtractor(self.llm)
     
     def _load_tools(self) -> Dict[str, Any]:
         """Dynamically load all tools from tools/ directory."""
@@ -64,6 +66,15 @@ User: {user_input}
 JARVIS:"""
         return prompt
     
+    def _extract_facts(self, user_input: str, response: str):
+        """Silently extract facts from the exchange."""
+        try:
+            facts = self.extractor.extract(user_input, response, self.memory)
+            if facts:
+                print(f"  [Memory: stored {len(facts)} fact(s)]")
+        except Exception:
+            pass  # Extraction is a bonus, never block the main flow
+    
     def process(self, user_input: str) -> str:
         """Main entry point. Process user input and return response."""
         prompt = self._build_prompt(user_input)
@@ -88,11 +99,13 @@ JARVIS:"""
             
             final_response = self.llm.generate(follow_up_prompt, system=JARVIS_PERSONA)
             self.memory.log_message("jarvis", final_response, tool_call="[routed]")
+            self._extract_facts(user_input, final_response)
             return final_response
         else:
             # Direct response
             self.memory.log_message("user", user_input)
             self.memory.log_message("jarvis", raw_response)
+            self._extract_facts(user_input, raw_response)
             return raw_response
     
     def chat_loop(self):
