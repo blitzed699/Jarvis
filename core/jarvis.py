@@ -1,4 +1,5 @@
 import json
+import time
 import sys
 from typing import Dict, Any
 from .memory import JARVISMemory
@@ -11,6 +12,7 @@ from .projects import ProjectTracker
 from .goals import GoalTracker
 from .voice import VoiceSynthesizer
 from .config import Config
+from .evolution import EvolutionTracker
 import importlib
 import os
 
@@ -45,6 +47,7 @@ class JARVISCore:
         self.agents = AgentRegistry(self.llm)
         self.projects = ProjectTracker(self.memory.conn)
         self.goals = GoalTracker(self.memory.conn)
+        self.evolution = EvolutionTracker(self.memory.conn)
         self.voice = VoiceSynthesizer(enabled=self.config.get("voice_enabled", False))
         self.current_project = None
 
@@ -71,8 +74,8 @@ class JARVISCore:
         context = self.memory.format_working_memory_for_prompt(wm)
         tools_desc = self.router.get_tools_description()
         agents_desc = self.agents.get_descriptions()
+        insights = self.evolution.get_insights()
 
-        # Add active projects/goals context
         active_goals = self.goals.list_active()
         active_projects = self.projects.list_active()
         extra_context = ""
@@ -86,6 +89,8 @@ class JARVISCore:
 {tools_desc}
 
 {agents_desc}
+
+{insights}
 
 {context}{extra_context}
 
@@ -115,10 +120,34 @@ JARVIS:"""
         agent_name, reason = self.agents.select(user_input)
         if agent_name is None:
             return None
+
         print(f"  [Delegating to {agent_name}]")
-        self.memory.log_message("user", user_input, tool_call=f"delegate:{agent_name}")
+        start = time.time()
+
+        # Execute agent
         result = self.agents.delegate(agent_name, user_input)
         agent_output = result.get("result", "")
+        latency = int((time.time() - start) * 1000)
+
+        # Auto-critique agent output
+        if agent_name != "critic_agent":
+            critique = self.agents.critique(user_input, agent_output)
+            verdict = critique.get("verdict", "PASS")
+            print(f"  [Critic: {verdict}]")
+            if verdict == "REJECT":
+                self.evolution.log_action("agent", agent_name, False, latency, "Rejected by critic", user_input)
+                return "I need to reconsider that approach. Let me try again."
+            elif verdict == "NEEDS_FIX":
+                self.evolution.log_action("agent", agent_name, False, latency, "Needs fix per critic", user_input)
+                # Regenerate with critique feedback
+                fix_prompt = f"""{JARVIS_PERSONA}\n\nOriginal task: {user_input}\n\nFirst attempt had issues:\n{critique.get('review', '')}\n\nProvide a corrected response.\n\nJARVIS:"""
+                agent_output = self.llm.generate(fix_prompt, system=JARVIS_PERSONA)
+                result["result"] = agent_output
+            else:
+                self.evolution.log_action("agent", agent_name, True, latency, "", user_input)
+
+        # Synthesize
+        self.memory.log_message("user", user_input, tool_call=f"delegate:{agent_name}")
         synthesis_prompt = f"""{JARVIS_PERSONA}\n\nYou delegated to {agent_name}. Result:\n{agent_output}\n\nRespond naturally. Summarize what was accomplished. Be concise.\n\nUser: {user_input}\nJARVIS:"""
         final = self.llm.generate(synthesis_prompt, system=JARVIS_PERSONA)
         self.memory.log_message("jarvis", final, tool_call=f"delegate:{agent_name}")
@@ -126,7 +155,6 @@ JARVIS:"""
         return final
 
     def _handle_command(self, user_input: str) -> bool:
-        """Handle slash commands. Returns True if handled."""
         cmd = user_input.lower().strip()
 
         if cmd == "exit":
@@ -186,19 +214,30 @@ JARVIS:"""
             print("  Voice disabled.")
             return True
 
+        if cmd.startswith("feedback "):
+            try:
+                rating = int(user_input.split()[1])
+                comment = " ".join(user_input.split()[2:]) if len(user_input.split()) > 2 else ""
+                self.evolution.log_feedback(self.memory.current_session_id, rating, comment)
+                print(f"  Feedback recorded: {rating}/5")
+            except (ValueError, IndexError):
+                print("  Usage: feedback <1-5> [comment]")
+            return True
+
+        if cmd == "insights":
+            print(self.evolution.get_insights())
+            return True
+
         return False
 
     def process(self, user_input: str) -> str:
-        # Check commands first
         if self._handle_command(user_input):
             return ""
 
-        # Try agent delegation
         agent_response = self._handle_agent_task(user_input)
         if agent_response is not None:
             return agent_response
 
-        # Normal tool/direct flow
         prompt = self._build_prompt(user_input)
         raw_response = self.llm.generate(prompt, system=JARVIS_PERSONA)
 
@@ -206,9 +245,17 @@ JARVIS:"""
 
         if is_tool:
             self.memory.log_message("user", user_input, tool_call=tool_call["tool"], tool_result="[PENDING]")
+            start = time.time()
             result = self._execute_with_safety(tool_call)
+            latency = int((time.time() - start) * 1000)
 
-            if result.get("success"):
+            success = result.get("success", False)
+            self.evolution.log_action(
+                "tool", tool_call["tool"], success, latency,
+                result.get("result", "") if not success else "", user_input
+            )
+
+            if success:
                 result_str = json.dumps(result.get("result"), indent=2)
             else:
                 result_str = f"[ERROR] {result.get('result')}"
@@ -230,6 +277,7 @@ JARVIS:"""
         print("=" * 50)
         print("Commands: exit | tools | agents | goals | projects")
         print("          goal <title> | project <name> | voice on/off")
+        print("          feedback <1-5> [comment] | insights")
         print()
 
         while True:
