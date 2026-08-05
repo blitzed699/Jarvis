@@ -7,6 +7,10 @@ from .router import ToolRouter
 from .extractor import FactExtractor
 from .safety import SafetyGate
 from .agent_registry import AgentRegistry
+from .projects import ProjectTracker
+from .goals import GoalTracker
+from .voice import VoiceSynthesizer
+from .config import Config
 import importlib
 import os
 
@@ -23,14 +27,27 @@ Otherwise, respond naturally in character. Do not explain that you are an AI."""
 
 class JARVISCore:
     def __init__(self, model: str = "llama3.1"):
-        self.memory = JARVISMemory()
-        self.llm = OllamaClient(model=model)
+        self.config = Config()
+        self.memory = JARVISMemory(
+            db_path=self.config.get("memory_db"),
+            chroma_path=self.config.get("chroma_path")
+        )
+        self.llm = OllamaClient(
+            model=self.config.get("model", model),
+            base_url=self.config.get("base_url")
+        )
         self.tools = self._load_tools()
         self.router = ToolRouter(self.tools)
         self.extractor = FactExtractor(self.llm)
-        self.safety = SafetyGate()
+        self.safety = SafetyGate(
+            auto_approve_readonly=self.config.get("auto_approve_readonly", True)
+        )
         self.agents = AgentRegistry(self.llm)
-    
+        self.projects = ProjectTracker(self.memory.conn)
+        self.goals = GoalTracker(self.memory.conn)
+        self.voice = VoiceSynthesizer(enabled=self.config.get("voice_enabled", False))
+        self.current_project = None
+
     def _load_tools(self) -> Dict[str, Any]:
         tools = {}
         tools_dir = os.path.join(os.path.dirname(__file__), "..", "tools")
@@ -48,25 +65,34 @@ class JARVISCore:
                 except Exception as e:
                     print(f"[WARN] Tool load error: {e}")
         return tools
-    
+
     def _build_prompt(self, user_input: str) -> str:
         wm = self.memory.get_working_memory(current_query=user_input)
         context = self.memory.format_working_memory_for_prompt(wm)
         tools_desc = self.router.get_tools_description()
         agents_desc = self.agents.get_descriptions()
-        
+
+        # Add active projects/goals context
+        active_goals = self.goals.list_active()
+        active_projects = self.projects.list_active()
+        extra_context = ""
+        if active_goals:
+            extra_context += "\n## Active Goals\n" + "\n".join([f"- [{g['progress']}%] {g['title']}" for g in active_goals[:3]])
+        if active_projects:
+            extra_context += "\n## Active Projects\n" + "\n".join([f"- {p['name']}: {p['status']}" for p in active_projects[:3]])
+
         prompt = f"""{JARVIS_PERSONA}
 
 {tools_desc}
 
 {agents_desc}
 
-{context}
+{context}{extra_context}
 
 User: {user_input}
 JARVIS:"""
         return prompt
-    
+
     def _extract_facts(self, user_input: str, response: str):
         try:
             facts = self.extractor.extract(user_input, response, self.memory)
@@ -74,7 +100,7 @@ JARVIS:"""
                 print(f"  [Memory: stored {len(facts)} fact(s)]")
         except Exception:
             pass
-    
+
     def _execute_with_safety(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
         tool_name = tool_call.get("tool")
         params = tool_call.get("params", {})
@@ -84,72 +110,110 @@ JARVIS:"""
             if not approved:
                 return {"success": False, "result": "User denied approval."}
         return self.router.execute(tool_call)
-    
+
     def _handle_agent_task(self, user_input: str) -> str:
-        """Check if an agent should handle this, delegate if so."""
         agent_name, reason = self.agents.select(user_input)
-        
         if agent_name is None:
-            return None  # No agent needed, handle normally
-        
+            return None
         print(f"  [Delegating to {agent_name}]")
-        
-        # Log delegation
         self.memory.log_message("user", user_input, tool_call=f"delegate:{agent_name}")
-        
-        # Execute through agent
         result = self.agents.delegate(agent_name, user_input)
-        
-        # Synthesize agent result through JARVIS persona
         agent_output = result.get("result", "")
-        agent_code = result.get("code", "")
-        
-        synthesis_prompt = f"""{JARVIS_PERSONA}
-
-You delegated to the {agent_name}. Here is the result:
-{agent_output}
-
-Respond to the user naturally. Summarize what was accomplished. Be concise.
-
-User: {user_input}
-JARVIS:"""
-        
+        synthesis_prompt = f"""{JARVIS_PERSONA}\n\nYou delegated to {agent_name}. Result:\n{agent_output}\n\nRespond naturally. Summarize what was accomplished. Be concise.\n\nUser: {user_input}\nJARVIS:"""
         final = self.llm.generate(synthesis_prompt, system=JARVIS_PERSONA)
         self.memory.log_message("jarvis", final, tool_call=f"delegate:{agent_name}")
         self._extract_facts(user_input, final)
         return final
-    
+
+    def _handle_command(self, user_input: str) -> bool:
+        """Handle slash commands. Returns True if handled."""
+        cmd = user_input.lower().strip()
+
+        if cmd == "exit":
+            self.memory.end_session("User exited.")
+            self.memory.close()
+            print("JARVIS: Goodbye.")
+            return True
+
+        if cmd == "tools":
+            print("Tools:", list(self.tools.keys()))
+            return True
+
+        if cmd == "agents":
+            print("Agents:", list(self.agents.agents.keys()))
+            return True
+
+        if cmd == "goals":
+            goals = self.goals.list_active()
+            if goals:
+                for g in goals:
+                    print(f"  [{g['progress']}%] {g['title']}")
+            else:
+                print("  No active goals.")
+            return True
+
+        if cmd == "projects":
+            projects = self.projects.list_active()
+            if projects:
+                for p in projects:
+                    print(f"  {p['name']} ({p['status']})")
+            else:
+                print("  No active projects.")
+            return True
+
+        if cmd.startswith("goal "):
+            title = user_input[5:].strip()
+            gid = self.goals.add(title)
+            print(f"  Goal added: {title} ({gid})")
+            return True
+
+        if cmd.startswith("project "):
+            name = user_input[8:].strip()
+            pid = self.projects.create(name)
+            self.current_project = pid
+            print(f"  Project created: {name} ({pid})")
+            return True
+
+        if cmd == "voice on":
+            self.config.set("voice_enabled", True)
+            self.voice.enabled = True
+            print("  Voice enabled.")
+            return True
+
+        if cmd == "voice off":
+            self.config.set("voice_enabled", False)
+            self.voice.enabled = False
+            print("  Voice disabled.")
+            return True
+
+        return False
+
     def process(self, user_input: str) -> str:
-        # Try agent delegation first
+        # Check commands first
+        if self._handle_command(user_input):
+            return ""
+
+        # Try agent delegation
         agent_response = self._handle_agent_task(user_input)
         if agent_response is not None:
             return agent_response
-        
-        # Fall back to normal tool/direct flow
+
+        # Normal tool/direct flow
         prompt = self._build_prompt(user_input)
         raw_response = self.llm.generate(prompt, system=JARVIS_PERSONA)
-        
+
         is_tool, tool_call = self.router.parse_response(raw_response)
-        
+
         if is_tool:
             self.memory.log_message("user", user_input, tool_call=tool_call["tool"], tool_result="[PENDING]")
             result = self._execute_with_safety(tool_call)
-            
+
             if result.get("success"):
                 result_str = json.dumps(result.get("result"), indent=2)
             else:
                 result_str = f"[ERROR] {result.get('result')}"
-            
-            follow_up = f"""{JARVIS_PERSONA}
 
-You used tool '{tool_call['tool']}' with result:
-{result_str}
-
-Respond naturally. Be concise.
-
-User: {user_input}
-JARVIS:"""
-            
+            follow_up = f"""{JARVIS_PERSONA}\n\nYou used tool '{tool_call['tool']}' with result:\n{result_str}\n\nRespond naturally. Be concise.\n\nUser: {user_input}\nJARVIS:"""
             final_response = self.llm.generate(follow_up, system=JARVIS_PERSONA)
             self.memory.log_message("jarvis", final_response, tool_call=tool_call["tool"])
             self._extract_facts(user_input, final_response)
@@ -159,35 +223,27 @@ JARVIS:"""
             self.memory.log_message("jarvis", raw_response)
             self._extract_facts(user_input, raw_response)
             return raw_response
-    
+
     def chat_loop(self):
         print("=" * 50)
         print("JARVIS v0.3 — Local AI Partner")
         print("=" * 50)
-        print("Type 'exit' to quit, 'tools' to list tools, 'agents' to list agents.")
+        print("Commands: exit | tools | agents | goals | projects")
+        print("          goal <title> | project <name> | voice on/off")
         print()
-        
+
         while True:
             try:
                 user_input = input("You: ").strip()
                 if not user_input:
                     continue
-                if user_input.lower() == "exit":
-                    self.memory.end_session("User exited.")
-                    self.memory.close()
-                    print("JARVIS: Goodbye.")
-                    break
-                if user_input.lower() == "tools":
-                    print("Tools:", list(self.tools.keys()))
-                    continue
-                if user_input.lower() == "agents":
-                    print("Agents:", list(self.agents.agents.keys()))
-                    continue
-                
+
                 response = self.process(user_input)
-                print(f"JARVIS: {response}")
+                if response:
+                    print(f"JARVIS: {response}")
+                    self.voice.speak(response)
                 print()
-            
+
             except KeyboardInterrupt:
                 print("\nJARVIS: Session interrupted.")
                 self.memory.end_session("Interrupted.")
