@@ -162,7 +162,7 @@ JARVIS:"""
     
     def chat_loop(self):
         print("=" * 50)
-        print("JARVIS v0.2 — Local AI Partner")
+        print("JARVIS v0.3 — Local AI Partner")
         print("=" * 50)
         print("Type 'exit' to quit, 'tools' to list tools, 'agents' to list agents.")
         print()
