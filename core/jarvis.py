@@ -152,29 +152,35 @@ JARVIS:"""
         return final
 
     def _handle_autonomous(self, goal: str) -> str:
-        """Execute a multi-step goal through the planner."""
         print(f"\n  [Autonomous Planning: {goal}]")
-        self.planner.tasks = []  # Reset
+        self.planner.tasks = []
         tasks = self.planner.plan(goal)
         print(f"  [Plan: {len(tasks)} steps]")
-
         for t in tasks:
             print(f"    Step {t.id}: {t.description} ({t.agent})")
-
         result = self.planner.execute(goal, self.memory)
-
-        # Log to project if active
         if self.current_project:
             self.projects.log(self.current_project, self.memory.current_session_id, f"Autonomous task: {goal} -> {result['summary']}")
-
         self.memory.log_message("user", f"plan: {goal}")
         self.memory.log_message("jarvis", result["summary"], tool_call="planner")
-
-        # Synthesize final response
         synth = f"""{JARVIS_PERSONA}\n\nYou completed a multi-step task:\n{result['summary']}\n\nRespond to the user with the outcome. Be concise.\n\nUser: {goal}\nJARVIS:"""
         final = self.llm.generate(synth, system=JARVIS_PERSONA)
         self._extract_facts(goal, final)
         return final
+
+    def _handle_vision(self, user_input: str) -> str:
+        """Handle vision requests directly."""
+        if "vision" not in self.tools:
+            return "Vision tool not available. Install a vision model: ollama pull llava"
+        query = user_input.replace("look", "").replace("see", "").replace("what do you", "").strip() or "Describe what you see."
+        print("  [Capturing screen...]")
+        result = self.tools["vision"].run(mode="screen", query=query)
+        if result.get("success"):
+            self.memory.log_message("user", user_input, tool_call="vision", tool_result=result["result"][:200])
+            self.memory.log_message("jarvis", result["result"], tool_call="vision")
+            return result["result"]
+        else:
+            return f"Vision failed: {result.get('result')}"
 
     def _handle_command(self, user_input: str) -> bool:
         cmd = user_input.lower().strip()
@@ -256,12 +262,17 @@ JARVIS:"""
         if self._handle_command(user_input):
             return ""
 
-        # Detect autonomous planning mode
+        # Vision shortcuts
+        vision_triggers = ["look", "what do you see", "what is on my screen", "describe my screen", "see this"]
+        if any(t in user_input.lower() for t in vision_triggers):
+            return self._handle_vision(user_input)
+
+        # Autonomous planning
         if user_input.lower().startswith("plan "):
             goal = user_input[5:].strip()
             return self._handle_autonomous(goal)
 
-        # Try agent delegation
+        # Agent delegation
         agent_response = self._handle_agent_task(user_input)
         if agent_response is not None:
             return agent_response
@@ -305,6 +316,7 @@ JARVIS:"""
         print("          goal <title> | project <name> | voice on/off")
         print("          feedback <1-5> [comment] | insights")
         print("          plan <goal>  — autonomous multi-step execution")
+        print("          look / what do you see  — vision (needs llava)")
         print()
 
         while True:
