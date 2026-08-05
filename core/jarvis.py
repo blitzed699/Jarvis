@@ -13,6 +13,7 @@ from .goals import GoalTracker
 from .voice import VoiceSynthesizer
 from .config import Config
 from .evolution import EvolutionTracker
+from .planner import AutonomousPlanner
 import importlib
 import os
 
@@ -48,6 +49,7 @@ class JARVISCore:
         self.projects = ProjectTracker(self.memory.conn)
         self.goals = GoalTracker(self.memory.conn)
         self.evolution = EvolutionTracker(self.memory.conn)
+        self.planner = AutonomousPlanner(self.llm, self.agents, self.router, self.safety, self.evolution)
         self.voice = VoiceSynthesizer(enabled=self.config.get("voice_enabled", False))
         self.current_project = None
 
@@ -123,13 +125,10 @@ JARVIS:"""
 
         print(f"  [Delegating to {agent_name}]")
         start = time.time()
-
-        # Execute agent
         result = self.agents.delegate(agent_name, user_input)
         agent_output = result.get("result", "")
         latency = int((time.time() - start) * 1000)
 
-        # Auto-critique agent output
         if agent_name != "critic_agent":
             critique = self.agents.critique(user_input, agent_output)
             verdict = critique.get("verdict", "PASS")
@@ -139,19 +138,42 @@ JARVIS:"""
                 return "I need to reconsider that approach. Let me try again."
             elif verdict == "NEEDS_FIX":
                 self.evolution.log_action("agent", agent_name, False, latency, "Needs fix per critic", user_input)
-                # Regenerate with critique feedback
                 fix_prompt = f"""{JARVIS_PERSONA}\n\nOriginal task: {user_input}\n\nFirst attempt had issues:\n{critique.get('review', '')}\n\nProvide a corrected response.\n\nJARVIS:"""
                 agent_output = self.llm.generate(fix_prompt, system=JARVIS_PERSONA)
                 result["result"] = agent_output
             else:
                 self.evolution.log_action("agent", agent_name, True, latency, "", user_input)
 
-        # Synthesize
         self.memory.log_message("user", user_input, tool_call=f"delegate:{agent_name}")
         synthesis_prompt = f"""{JARVIS_PERSONA}\n\nYou delegated to {agent_name}. Result:\n{agent_output}\n\nRespond naturally. Summarize what was accomplished. Be concise.\n\nUser: {user_input}\nJARVIS:"""
         final = self.llm.generate(synthesis_prompt, system=JARVIS_PERSONA)
         self.memory.log_message("jarvis", final, tool_call=f"delegate:{agent_name}")
         self._extract_facts(user_input, final)
+        return final
+
+    def _handle_autonomous(self, goal: str) -> str:
+        """Execute a multi-step goal through the planner."""
+        print(f"\n  [Autonomous Planning: {goal}]")
+        self.planner.tasks = []  # Reset
+        tasks = self.planner.plan(goal)
+        print(f"  [Plan: {len(tasks)} steps]")
+
+        for t in tasks:
+            print(f"    Step {t.id}: {t.description} ({t.agent})")
+
+        result = self.planner.execute(goal, self.memory)
+
+        # Log to project if active
+        if self.current_project:
+            self.projects.log(self.current_project, self.memory.current_session_id, f"Autonomous task: {goal} -> {result['summary']}")
+
+        self.memory.log_message("user", f"plan: {goal}")
+        self.memory.log_message("jarvis", result["summary"], tool_call="planner")
+
+        # Synthesize final response
+        synth = f"""{JARVIS_PERSONA}\n\nYou completed a multi-step task:\n{result['summary']}\n\nRespond to the user with the outcome. Be concise.\n\nUser: {goal}\nJARVIS:"""
+        final = self.llm.generate(synth, system=JARVIS_PERSONA)
+        self._extract_facts(goal, final)
         return final
 
     def _handle_command(self, user_input: str) -> bool:
@@ -234,10 +256,17 @@ JARVIS:"""
         if self._handle_command(user_input):
             return ""
 
+        # Detect autonomous planning mode
+        if user_input.lower().startswith("plan "):
+            goal = user_input[5:].strip()
+            return self._handle_autonomous(goal)
+
+        # Try agent delegation
         agent_response = self._handle_agent_task(user_input)
         if agent_response is not None:
             return agent_response
 
+        # Normal tool/direct flow
         prompt = self._build_prompt(user_input)
         raw_response = self.llm.generate(prompt, system=JARVIS_PERSONA)
 
@@ -250,10 +279,7 @@ JARVIS:"""
             latency = int((time.time() - start) * 1000)
 
             success = result.get("success", False)
-            self.evolution.log_action(
-                "tool", tool_call["tool"], success, latency,
-                result.get("result", "") if not success else "", user_input
-            )
+            self.evolution.log_action("tool", tool_call["tool"], success, latency, result.get("result", "") if not success else "", user_input)
 
             if success:
                 result_str = json.dumps(result.get("result"), indent=2)
@@ -278,6 +304,7 @@ JARVIS:"""
         print("Commands: exit | tools | agents | goals | projects")
         print("          goal <title> | project <name> | voice on/off")
         print("          feedback <1-5> [comment] | insights")
+        print("          plan <goal>  — autonomous multi-step execution")
         print()
 
         while True:
