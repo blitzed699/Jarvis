@@ -22,7 +22,8 @@ DESTRUCTIVE_PATTERNS = [
 DESTRUCTIVE_TOOL_NAMES = {"shell", "write_file", "run_python", "organize_files"}
 
 
-READONLY_TOOL_NAMES = {"file_read", "file_list", "open_app", "web_search"}
+READONLY_TOOL_NAMES = {"file_read", "file_list", "open_app", "web_search", "vision"}
+
 
 
 class SafetyGate:
