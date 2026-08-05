@@ -7,7 +7,7 @@ class AgentRegistry:
     def __init__(self, llm_client):
         self.llm = llm_client
         self.agents = self._load_agents()
-    
+
     def _load_agents(self) -> Dict[str, Any]:
         agents = {}
         agents_dir = os.path.join(os.path.dirname(__file__), "..", "agents")
@@ -25,20 +25,26 @@ class AgentRegistry:
                 except Exception as e:
                     print(f"[WARN] Agent load error: {e}")
         return agents
-    
+
     def get_descriptions(self) -> str:
         return "\n".join([f"- {n}: {a.description}" for n, a in self.agents.items()])
-    
+
     def select(self, user_input: str) -> tuple:
         desc = self.get_descriptions()
-        prompt = f"You are JARVIS router.\n{desc}\n\nRequest: {user_input}\n\nRespond ONLY with:\n- AGENT: coding_agent\n- AGENT: research_agent\n- DIRECT"
+        prompt = f"You are JARVIS router.\n{desc}\n\nRequest: {user_input}\n\nRespond ONLY with:\n- AGENT: coding_agent\n- AGENT: research_agent\n- AGENT: business_agent\n- AGENT: creative_agent\n- DIRECT"
         response = self.llm.generate(prompt).strip().lower()
         for name in self.agents:
             if f"agent: {name}" in response:
                 return name, f"Routed to {name}"
         return None, "Direct"
-    
+
     def delegate(self, agent_name: str, task: str, context: str = "") -> Dict[str, Any]:
         if agent_name not in self.agents:
             return {"success": False, "result": f"Agent '{agent_name}' not found"}
         return self.agents[agent_name].run(task, context)
+
+    def critique(self, original_task: str, agent_output: str) -> Dict[str, Any]:
+        """Run critic agent on another agent's output."""
+        if "critic_agent" not in self.agents:
+            return {"success": True, "verdict": "PASS", "review": "No critic available"}
+        return self.agents["critic_agent"].run(agent_output, context=original_task)
