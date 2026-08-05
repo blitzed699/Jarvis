@@ -1,7 +1,7 @@
 # JARVIS v0.3
 Local-First AI Assistant
 
-A modular, local-first AI assistant with persistent memory, intelligent tool use, specialist agents, safety controls, and automated testing.
+A modular, local-first AI assistant with persistent memory, intelligent tool use, specialist agents, project management, goal tracking, voice support, safety controls, and automated testing.
 
 ══════════════════════════════════════════════
 SETUP
@@ -9,104 +9,180 @@ SETUP
 
 Clone the repository:
 
-git clone https://github.com/blitzed699/Jarvis
+```bash
+git clone <your-repo-url>
 cd jarvis
+```
 
 Install Ollama:
 
+```bash
 curl -fsSL https://ollama.com/install.sh | sh
+```
 
 Download the default language model:
 
+```bash
 ollama pull llama3.1
+```
 
-Install Python requirements:
+Install Python dependencies:
 
+```bash
 pip install -r requirements.txt
+```
 
-Start JARVIS:
+Launch JARVIS:
 
+```bash
 python main.py
+```
 
 ══════════════════════════════════════════════
-USAGE
+COMMANDS
 ══════════════════════════════════════════════
 
-• Chat naturally with JARVIS.
-• Type "tools" to display all installed tools.
-• Type "agents" to display all available specialist agents.
-• Type "exit" to close JARVIS.
+| Command | Action |
+|---------|--------|
+| `exit` | Quit JARVIS |
+| `tools` | List all available tools |
+| `agents` | List all specialist agents |
+| `goals` | Display active goals |
+| `projects` | Display active projects |
+| `goal <title>` | Create a new goal |
+| `project <name>` | Create a new project |
+| `voice on` | Enable voice output |
+| `voice off` | Disable voice output |
 
 ══════════════════════════════════════════════
-TOOLS (7)
+TOOLS (8)
 ══════════════════════════════════════════════
 
-1. file_read
-   Auto Approved: Yes
-   Reads the contents of files.
-
-2. file_list
-   Auto Approved: Yes
-   Lists files and folders inside directories.
-
-3. open_app
-   Auto Approved: Yes
-   Launches installed desktop applications.
-
-4. shell
-   Auto Approved: No
-   Executes terminal or shell commands.
-
-5. write_file
-   Auto Approved: No
-   Creates or modifies files containing text or source code.
-
-6. run_python
-   Auto Approved: No
-   Executes Python scripts.
-
-7. organize_files
-   Auto Approved: No
-   Automatically sorts and moves files according to configurable rules.
+| Tool | Auto-Approve | Description |
+|------|--------------|-------------|
+| file_read | Yes | Read file contents |
+| file_list | Yes | List directory contents |
+| open_app | Yes | Launch desktop applications |
+| web_search | Yes | Search the web |
+| shell | No | Execute shell commands |
+| write_file | No | Create or edit files |
+| run_python | No | Execute Python scripts |
+| organize_files | No | Automatically organize files using rules |
 
 ══════════════════════════════════════════════
 SPECIALIST AGENTS (4)
 ══════════════════════════════════════════════
 
-coding_agent
+### coding_agent
 • Plans software architecture
 • Writes production-ready code
 • Debugs applications
-• Runs and interprets tests
+• Executes tests
 • Refactors existing code
 
-research_agent
-• Searches for technical information
+### research_agent
+• Searches for information
 • Summarizes documentation
 • Compares technologies
 • Produces research reports
 
-business_agent
+### business_agent
 • Performs market analysis
-• Identifies business opportunities
+• Identifies profitable niches
 • Suggests monetization strategies
-• Evaluates niches and competition
+• Evaluates competition
 
-creative_agent
+### creative_agent
 • Generates product ideas
 • Creates branding concepts
-• Writes marketing material
+• Writes marketing copy
 • Brainstorms names and slogans
 
 ══════════════════════════════════════════════
-TEST SUITE
+GOALS
 ══════════════════════════════════════════════
 
-Run individual tests:
+JARVIS can:
 
+• Store long-term goals
+• Track progress
+• Prioritize objectives
+• Display all active goals
+• Link goals to projects
+
+Examples:
+
+goal Build a smart home assistant
+
+goal Learn Rust programming
+
+══════════════════════════════════════════════
+PROJECTS
+══════════════════════════════════════════════
+
+Projects organize conversations, files, goals, and memory into dedicated workspaces.
+
+Each project can contain:
+
+• Multiple goals
+• Notes
+• Generated code
+• Research
+• Task history
+• Associated memories
+
+Example:
+
+project Jarvis AI
+
+══════════════════════════════════════════════
+VOICE
+══════════════════════════════════════════════
+
+Voice can be enabled or disabled at any time.
+
+Commands:
+
+voice on
+voice off
+
+Voice features:
+
+✔ Natural speech output
+✔ Hands-free interaction
+✔ Future wake-word support
+
+══════════════════════════════════════════════
+CONFIGURATION
+══════════════════════════════════════════════
+
+Edit `config.yaml` to customize JARVIS.
+
+Available options:
+
+model
+• Ollama model to load
+
+voice_enabled
+• true / false
+
+temperature
+• LLM creativity level (0.0 - 1.0)
+
+auto_approve_readonly
+• Skip approval prompts for safe read-only tools
+
+══════════════════════════════════════════════
+TESTING
+══════════════════════════════════════════════
+
+Run the automated test suite:
+
+```bash
 python tests/test_memory.py
 python tests/test_tools.py
 python tests/test_agents.py
+```
 
 ══════════════════════════════════════════════
 SYSTEM ARCHITECTURE
@@ -114,14 +190,14 @@ SYSTEM ARCHITECTURE
 
 core/jarvis.py
 • Main overseer
-• Conversation management
+• Conversation manager
 • Persona
 • Safety checks
 • Tool routing
 • Agent delegation
 
 core/memory.py
-• Persistent SQLite memory
+• SQLite persistent memory
 • ChromaDB semantic memory
 • Long-term memory retrieval
 
@@ -140,18 +216,18 @@ core/extractor.py
 
 core/safety.py
 • Approval system
-• Prevents destructive actions without confirmation
+• Protects against destructive actions
 
 core/agent_registry.py
-• Discovers available agents
-• Routes complex tasks to specialists
+• Agent discovery
+• Intelligent task routing
 
 tools/
 • File management
 • Shell execution
+• Web search
 • Computer control
 • File organization
-• Future extensions
 
 agents/
 • Coding Agent
@@ -160,21 +236,25 @@ agents/
 • Creative Agent
 
 tests/
-• Memory testing
-• Tool testing
-• Agent testing
+• Memory tests
+• Tool tests
+• Agent tests
 
 ══════════════════════════════════════════════
 FEATURES
 ══════════════════════════════════════════════
 
-✔ Runs completely locally using Ollama
+✔ Fully local AI powered by Ollama
 ✔ Persistent long-term memory
-✔ Semantic memory search with ChromaDB
-✔ Modular architecture
-✔ Tool execution system
+✔ Semantic memory using ChromaDB
+✔ Intelligent tool routing
+✔ Eight integrated tools
 ✔ Specialist AI agents
-✔ Safety approval for dangerous actions
-✔ Extensible plugin structure
+✔ Goal management
+✔ Project management
+✔ Voice support
+✔ Safety approval system
+✔ Modular architecture
 ✔ Automated testing
-✔ Designed to evolve into a full personal AI assistant
+✔ Extensible plugin-ready design
+✔ Built as the foundation for a true personal AI operating system
