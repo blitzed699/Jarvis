@@ -31,11 +31,34 @@ class AgentRegistry:
 
     def select(self, user_input: str) -> tuple:
         desc = self.get_descriptions()
-        prompt = f"You are JARVIS router.\n{desc}\n\nRequest: {user_input}\n\nRespond ONLY with:\n- AGENT: coding_agent\n- AGENT: research_agent\n- AGENT: business_agent\n- AGENT: creative_agent\n- DIRECT"
+        prompt = f"""You are JARVIS — a task router. Decide if a specialist agent should handle this request.
+
+Available agents:
+{desc}
+
+ROUTING RULES:
+- DIRECT for: greetings, small talk, questions about memory, personal info, simple facts, "what do you know", "what can you do"
+- AGENT for: specific tasks requiring expertise (coding, research, business analysis, creative design)
+
+User request: "{user_input}"
+
+Respond with EXACTLY one line:
+DIRECT
+or
+AGENT: <agent_name>"""
+
         response = self.llm.generate(prompt).strip().lower()
+
+        # Check for DIRECT first
+        if "direct" in response and "agent:" not in response:
+            return None, "Direct"
+
+        # Check for agent routing
         for name in self.agents:
             if f"agent: {name}" in response:
                 return name, f"Routed to {name}"
+
+        # Default to direct for anything ambiguous
         return None, "Direct"
 
     def delegate(self, agent_name: str, task: str, context: str = "") -> Dict[str, Any]:
