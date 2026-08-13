@@ -8,8 +8,8 @@ from dataclasses import dataclass, asdict
 class Subtask:
     id: int
     description: str
-    agent: str  # "coding_agent", "research_agent", "tool", "direct"
-    status: str = "pending"  # pending, running, done, failed
+    agent: str
+    status: str = "pending"
     result: str = ""
     depends_on: List[int] = None
 
@@ -19,14 +19,19 @@ class Subtask:
 
 
 PLANNER_PERSONA = """You are a task planner. Break the user's goal into numbered subtasks.
-Each subtask must specify who handles it: coding_agent, research_agent, business_agent, creative_agent, tool, or direct.
+Each subtask must specify who handles it using ONLY these options:
+- coding_agent (for writing code, scripts, apps)
+- research_agent (for gathering information, analysis)
+- business_agent (for market analysis, business strategy)
+- creative_agent (for design, branding, copywriting)
+- tool (for file operations, shell commands, web search)
+- llm (for direct text generation, summaries, explanations)
+
 Return ONLY a JSON array:
 [{"id": 1, "description": "...", "agent": "coding_agent", "depends_on": []}]"""
 
 
 class AutonomousPlanner:
-    """Breaks goals into subtasks and executes them sequentially."""
-
     def __init__(self, llm_client, agent_registry, tool_router, safety_gate, evolution_tracker):
         self.llm = llm_client
         self.agents = agent_registry
@@ -36,15 +41,12 @@ class AutonomousPlanner:
         self.tasks: List[Subtask] = []
 
     def plan(self, goal: str) -> List[Subtask]:
-        """Generate subtasks from a high-level goal."""
         prompt = f"{PLANNER_PERSONA}\n\nGoal: {goal}\n\nSubtasks:"
         response = self.llm.generate(prompt, system=PLANNER_PERSONA, max_tokens=1500)
 
-        # Parse JSON array
         try:
             raw_tasks = json.loads(response.strip())
         except json.JSONDecodeError:
-            # Try to extract JSON from text
             import re
             match = re.search(r'\[.*\]', response, re.DOTALL)
             raw_tasks = json.loads(match.group()) if match else []
@@ -53,7 +55,6 @@ class AutonomousPlanner:
         return self.tasks
 
     def execute(self, goal: str, memory) -> Dict[str, Any]:
-        """Run all subtasks in dependency order."""
         if not self.tasks:
             self.plan(goal)
 
@@ -61,7 +62,6 @@ class AutonomousPlanner:
         failed = []
 
         for task in self.tasks:
-            # Check dependencies
             if task.depends_on:
                 pending = [t for t in self.tasks if t.id in task.depends_on and t.status != "done"]
                 if pending:
@@ -76,12 +76,11 @@ class AutonomousPlanner:
             start = time.time()
             try:
                 if task.agent == "tool":
-                    # Parse tool call from description
                     result = self._execute_tool_task(task.description)
                 elif task.agent in self.agents.agents:
                     result = self.agents.delegate(task.agent, task.description)
                 else:
-                    # Direct LLM response
+                    # llm or unknown — direct generation
                     result = {"success": True, "result": self.llm.generate(task.description)}
 
                 latency = int((time.time() - start) * 1000)
@@ -110,8 +109,6 @@ class AutonomousPlanner:
         }
 
     def _execute_tool_task(self, description: str) -> Dict[str, Any]:
-        """Extract and execute a tool call from a description string."""
-        # Ask LLM to convert description to tool JSON
         prompt = f'Convert this task to a tool call JSON: {description}\nFormat: {{"tool": "name", "params": {{"key": "value"}}}}\nJSON:'
         raw = self.llm.generate(prompt, max_tokens=500)
 
