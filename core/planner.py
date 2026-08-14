@@ -48,6 +48,12 @@ def _extract_json(text: str):
 
 
 class AutonomousPlanner:
+    # Hardcoded — these are your real agents
+    VALID_AGENTS = {
+        "coding_agent", "research_agent", "business_agent",
+        "creative_agent", "tool", "llm"
+    }
+
     def __init__(self, llm_client, agent_registry, tool_router, safety_gate, evolution_tracker):
         self.llm = llm_client
         self.agents = agent_registry
@@ -88,80 +94,75 @@ Subtasks:"""
 
     def _correct_plan(self, tasks: List[dict], goal: str) -> List[dict]:
         """
-        Post-process the LLM-generated plan to fix common mistakes.
+        Post-process the LLM-generated plan.
         - Forces coding tasks to coding_agent
         - Removes redundant file-tool steps
-        - Merges save paths into coding_agent descriptions
+        - Merges multiple coding steps into one
         """
-        valid_agents = set(self.agents.agents.keys()) | {"tool", "llm"}
-        corrected = []
-        coding_keywords = re.compile(r'\b(python|script|code|program|app|function|class|write.*\.py|write.*\.js|write.*\.html)\b', re.I)
+        coding_keywords = re.compile(
+            r'\b(python|script|code|program|app|function|class|'
+            r'write.*\.py|write.*\.js|write.*\.html|build|develop)\b', re.I
+        )
         path_pattern = re.compile(r'(/\S+\.\w+)')
-
-        # Extract any file path from the goal
         goal_paths = path_pattern.findall(goal)
 
-        # First pass: validate agents and identify coding steps
+        # First pass: fix invalid agents
         for t in tasks:
             if not isinstance(t, dict):
                 continue
-
             agent = t.get("agent", "")
-            desc = t.get("description", "")
-
-            # Fix invalid agents
-            if agent not in valid_agents:
+            if agent not in self.VALID_AGENTS:
                 print(f" [Planner] Replaced invalid agent '{agent}' with 'llm'")
-                agent = "llm"
+                t["agent"] = "llm"
 
-            t["agent"] = agent
-            corrected.append(t)
-
-        # Second pass: if any step is coding-related, consolidate to coding_agent
+        # Detect if this is a coding job
         has_coding = any(
-            t["agent"] == "coding_agent" or coding_keywords.search(t["description"])
-            for t in corrected
+            t.get("agent") == "coding_agent" or coding_keywords.search(t.get("description", ""))
+            for t in tasks
         )
 
         if has_coding:
-            # Collect all file paths mentioned in tool steps
-            extra_paths = []
-            filtered = []
-            for t in corrected:
-                desc = t["description"]
-                agent = t["agent"]
+            descriptions = []
+            all_paths = list(goal_paths)
 
-                # If it's a tool step about file/save/write and we have coding_agent, drop it
-                if agent == "tool" and re.search(r'\b(save|write|create|file)\b', desc, re.I):
-                    paths = path_pattern.findall(desc)
-                    extra_paths.extend(paths)
+            for t in tasks:
+                desc = t.get("description", "")
+                agent = t.get("agent", "")
+
+                # Collect paths from every step
+                paths = path_pattern.findall(desc)
+                all_paths.extend(paths)
+
+                # Keep coding descriptions, drop file/save tool steps
+                if agent == "coding_agent" or coding_keywords.search(desc):
+                    descriptions.append(desc)
+                elif agent == "tool" and re.search(r'\b(save|write|create|file)\b', desc, re.I):
                     print(f" [Planner] Removed redundant tool step: {desc[:50]}...")
                     continue
+                else:
+                    descriptions.append(desc)
 
-                # If a step smells like coding but isn't assigned to coding_agent, fix it
-                if coding_keywords.search(desc) and agent != "coding_agent":
-                    print(f" [Planner] Reassigned coding task from '{agent}' to 'coding_agent'")
-                    t["agent"] = "coding_agent"
+            # Deduplicate paths
+            seen = set()
+            unique_paths = [p for p in all_paths if not (p in seen or seen.add(p))]
 
-                filtered.append(t)
+            # Build single merged step
+            merged_desc = " ".join(descriptions)
+            for p in unique_paths:
+                if p not in merged_desc:
+                    merged_desc += f" Save to {p}."
 
-            # Merge goal paths + extra paths into the coding_agent step
-            all_paths = goal_paths + extra_paths
-            if all_paths:
-                for t in filtered:
-                    if t["agent"] == "coding_agent":
-                        # Append path to description if not already there
-                        for p in all_paths:
-                            if p not in t["description"]:
-                                t["description"] += f" Save to {p}."
-                        break
+            return [{
+                "id": 1,
+                "description": merged_desc,
+                "agent": "coding_agent",
+                "depends_on": []
+            }]
 
-            corrected = filtered
-
-        # Re-number IDs sequentially
+        # Non-coding tasks: just renumber
+        corrected = [t for t in tasks if isinstance(t, dict)]
         for i, t in enumerate(corrected, 1):
             t["id"] = i
-
         return corrected
 
     def plan(self, goal: str) -> List[Subtask]:
@@ -172,7 +173,6 @@ Subtasks:"""
         if raw_tasks is None:
             raw_tasks = []
 
-        # Enforce rules in code, not just in prompts
         raw_tasks = self._correct_plan(raw_tasks, goal)
 
         self.tasks = [Subtask(**t) for t in raw_tasks if isinstance(t, dict)]
@@ -197,7 +197,6 @@ Subtasks:"""
             task.status = "running"
             print(f" [Step {task.id}] {task.description} -> {task.agent}")
 
-            # Build context from previous completed steps
             context = "\n".join(
                 f"[Previous Step {t.id}] {t.agent}: {t.result}"
                 for t in self.tasks
