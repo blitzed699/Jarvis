@@ -21,7 +21,9 @@ class CodingAgent(BaseAgent):
         code = self.llm.generate(prompt, system=persona)
         
         # Write to temp file
-        temp_path = f"/tmp/jarvis_code_{os.urandom(4).hex()}.py"
+import re as _re
+path_match = _re.search(r'/(?:tmp|home)[/\w\.]+', task)
+temp_path = path_match.group() if path_match else f"/tmp/jarvis_code_{os.urandom(4).hex()}.py"
         self.write_tool.run(path=temp_path, content=code)
         
         # Test
