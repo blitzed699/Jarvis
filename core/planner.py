@@ -23,11 +23,9 @@ def _extract_json(text: str):
     if not text:
         return None
 
-    # Remove markdown code blocks
     text = re.sub(r'```(?:json)?\s*', '', text)
     text = text.replace('```', '')
 
-    # Find first [ or {
     start_arr = text.find('[')
     start_obj = text.find('{')
 
@@ -59,7 +57,6 @@ class AutonomousPlanner:
         self.tasks: List[Subtask] = []
 
     def _build_planner_prompt(self, goal: str) -> str:
-        # Dynamically inject ONLY real agents — no hallucinations allowed
         registry_text = "\n".join(
             f"- {name}: {agent.description}"
             for name, agent in self.agents.agents.items()
@@ -69,46 +66,116 @@ class AutonomousPlanner:
 
 AVAILABLE AGENTS (you MUST use ONLY these names):
 {registry_text}
-- tool: for file operations, shell commands, web search
+- tool: for shell commands, web search, opening apps
 - llm: for direct text generation, summaries, explanations
 
 RULES:
 1. Each subtask MUST use an agent name from AVAILABLE AGENTS above.
-2. NEVER invent agent names like "direct", "system", or "user".
-3. If coding_agent is assigned to write code, DO NOT add separate tool steps for file creation or saving. coding_agent handles its own file I/O.
-4. Return ONLY a raw JSON array. No markdown, no explanations, no code fences.
+2. NEVER invent agent names.
+3. If the task involves writing code, scripts, or programs → use coding_agent ONLY.
+4. coding_agent handles its own file creation and saving. NEVER add separate tool steps for file operations.
+5. Return ONLY a raw JSON array. No markdown, no explanations.
 
-JSON FORMAT:
+EXAMPLE:
+Goal: Write a Python script that says hello world and save it to /tmp/hello.py
 [
-  {{"id": 1, "description": "...", "agent": "coding_agent", "depends_on": []}}
+  {{"id": 1, "description": "Write a Python script that prints 'Hello World' and save it to /tmp/hello.py", "agent": "coding_agent", "depends_on": []}}
 ]
 
 Goal: {goal}
 
 Subtasks:"""
 
+    def _correct_plan(self, tasks: List[dict], goal: str) -> List[dict]:
+        """
+        Post-process the LLM-generated plan to fix common mistakes.
+        - Forces coding tasks to coding_agent
+        - Removes redundant file-tool steps
+        - Merges save paths into coding_agent descriptions
+        """
+        valid_agents = set(self.agents.agents.keys()) | {"tool", "llm"}
+        corrected = []
+        coding_keywords = re.compile(r'\b(python|script|code|program|app|function|class|write.*\.py|write.*\.js|write.*\.html)\b', re.I)
+        path_pattern = re.compile(r'(/\S+\.\w+)')
+
+        # Extract any file path from the goal
+        goal_paths = path_pattern.findall(goal)
+
+        # First pass: validate agents and identify coding steps
+        for t in tasks:
+            if not isinstance(t, dict):
+                continue
+
+            agent = t.get("agent", "")
+            desc = t.get("description", "")
+
+            # Fix invalid agents
+            if agent not in valid_agents:
+                print(f" [Planner] Replaced invalid agent '{agent}' with 'llm'")
+                agent = "llm"
+
+            t["agent"] = agent
+            corrected.append(t)
+
+        # Second pass: if any step is coding-related, consolidate to coding_agent
+        has_coding = any(
+            t["agent"] == "coding_agent" or coding_keywords.search(t["description"])
+            for t in corrected
+        )
+
+        if has_coding:
+            # Collect all file paths mentioned in tool steps
+            extra_paths = []
+            filtered = []
+            for t in corrected:
+                desc = t["description"]
+                agent = t["agent"]
+
+                # If it's a tool step about file/save/write and we have coding_agent, drop it
+                if agent == "tool" and re.search(r'\b(save|write|create|file)\b', desc, re.I):
+                    paths = path_pattern.findall(desc)
+                    extra_paths.extend(paths)
+                    print(f" [Planner] Removed redundant tool step: {desc[:50]}...")
+                    continue
+
+                # If a step smells like coding but isn't assigned to coding_agent, fix it
+                if coding_keywords.search(desc) and agent != "coding_agent":
+                    print(f" [Planner] Reassigned coding task from '{agent}' to 'coding_agent'")
+                    t["agent"] = "coding_agent"
+
+                filtered.append(t)
+
+            # Merge goal paths + extra paths into the coding_agent step
+            all_paths = goal_paths + extra_paths
+            if all_paths:
+                for t in filtered:
+                    if t["agent"] == "coding_agent":
+                        # Append path to description if not already there
+                        for p in all_paths:
+                            if p not in t["description"]:
+                                t["description"] += f" Save to {p}."
+                        break
+
+            corrected = filtered
+
+        # Re-number IDs sequentially
+        for i, t in enumerate(corrected, 1):
+            t["id"] = i
+
+        return corrected
+
     def plan(self, goal: str) -> List[Subtask]:
         prompt = self._build_planner_prompt(goal)
         response = self.llm.generate(prompt, max_tokens=1500)
 
-        # Extract JSON
         raw_tasks = _extract_json(response)
         if raw_tasks is None:
             raw_tasks = []
 
-        # Validate agent names
-        valid_agents = set(self.agents.agents.keys()) | {"tool", "llm"}
-        cleaned = []
-        for t in raw_tasks:
-            if not isinstance(t, dict):
-                continue
-            agent = t.get("agent", "")
-            if agent not in valid_agents:
-                print(f" [Planner] Rejected invalid agent '{agent}', falling back to 'llm'")
-                t["agent"] = "llm"
-            cleaned.append(t)
+        # Enforce rules in code, not just in prompts
+        raw_tasks = self._correct_plan(raw_tasks, goal)
 
-        self.tasks = [Subtask(**t) for t in cleaned]
+        self.tasks = [Subtask(**t) for t in raw_tasks if isinstance(t, dict)]
         return self.tasks
 
     def execute(self, goal: str, memory) -> Dict[str, Any]:
@@ -130,8 +197,7 @@ Subtasks:"""
             task.status = "running"
             print(f" [Step {task.id}] {task.description} -> {task.agent}")
 
-            # FUTURE FIX: Build context from previous completed steps
-            # so each step knows what came before it
+            # Build context from previous completed steps
             context = "\n".join(
                 f"[Previous Step {t.id}] {t.agent}: {t.result}"
                 for t in self.tasks
@@ -141,15 +207,12 @@ Subtasks:"""
             start = time.time()
             try:
                 if task.agent == "tool":
-                    # Inject context into tool task description
                     full_desc = f"{context}\n\nCurrent task: {task.description}" if context else task.description
                     result = self._execute_tool_task(full_desc)
                 elif task.agent in self.agents.agents:
-                    # Inject context into agent task
                     full_task = f"{context}\n\nYour task: {task.description}" if context else task.description
                     result = self.agents.delegate(task.agent, full_task)
                 else:
-                    # llm or unknown — direct generation with context
                     full_prompt = f"{context}\n\nNow do this: {task.description}" if context else task.description
                     result = {"success": True, "result": self.llm.generate(full_prompt)}
 
