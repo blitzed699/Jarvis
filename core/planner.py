@@ -60,9 +60,6 @@ class AutonomousPlanner:
 
     def _build_planner_prompt(self, goal: str) -> str:
         # Dynamically inject ONLY real agents — no hallucinations allowed
-        agent_names = list(self.agents.agents.keys())
-        valid_agents = agent_names + ["tool", "llm"]
-
         registry_text = "\n".join(
             f"- {name}: {agent.description}"
             for name, agent in self.agents.agents.items()
@@ -78,7 +75,8 @@ AVAILABLE AGENTS (you MUST use ONLY these names):
 RULES:
 1. Each subtask MUST use an agent name from AVAILABLE AGENTS above.
 2. NEVER invent agent names like "direct", "system", or "user".
-3. Return ONLY a raw JSON array. No markdown, no explanations, no code fences.
+3. If coding_agent is assigned to write code, DO NOT add separate tool steps for file creation or saving. coding_agent handles its own file I/O.
+4. Return ONLY a raw JSON array. No markdown, no explanations, no code fences.
 
 JSON FORMAT:
 [
@@ -132,15 +130,28 @@ Subtasks:"""
             task.status = "running"
             print(f" [Step {task.id}] {task.description} -> {task.agent}")
 
+            # FUTURE FIX: Build context from previous completed steps
+            # so each step knows what came before it
+            context = "\n".join(
+                f"[Previous Step {t.id}] {t.agent}: {t.result}"
+                for t in self.tasks
+                if t.status == "done" and t.result
+            )
+
             start = time.time()
             try:
                 if task.agent == "tool":
-                    result = self._execute_tool_task(task.description)
+                    # Inject context into tool task description
+                    full_desc = f"{context}\n\nCurrent task: {task.description}" if context else task.description
+                    result = self._execute_tool_task(full_desc)
                 elif task.agent in self.agents.agents:
-                    result = self.agents.delegate(task.agent, task.description)
+                    # Inject context into agent task
+                    full_task = f"{context}\n\nYour task: {task.description}" if context else task.description
+                    result = self.agents.delegate(task.agent, full_task)
                 else:
-                    # llm or unknown — direct generation
-                    result = {"success": True, "result": self.llm.generate(task.description)}
+                    # llm or unknown — direct generation with context
+                    full_prompt = f"{context}\n\nNow do this: {task.description}" if context else task.description
+                    result = {"success": True, "result": self.llm.generate(full_prompt)}
 
                 latency = int((time.time() - start) * 1000)
                 task.status = "done" if result.get("success") else "failed"
