@@ -1,8 +1,8 @@
 import json
 import time
+import re
 from typing import Dict, Any, List
 from dataclasses import dataclass, asdict
-
 
 @dataclass
 class Subtask:
@@ -18,17 +18,35 @@ class Subtask:
             self.depends_on = []
 
 
-PLANNER_PERSONA = """You are a task planner. Break the user's goal into numbered subtasks.
-Each subtask must specify who handles it using ONLY these options:
-- coding_agent (for writing code, scripts, apps)
-- research_agent (for gathering information, analysis)
-- business_agent (for market analysis, business strategy)
-- creative_agent (for design, branding, copywriting)
-- tool (for file operations, shell commands, web search)
-- llm (for direct text generation, summaries, explanations)
+def _extract_json(text: str):
+    """Find the first JSON array or object in text, stripping markdown fences."""
+    if not text:
+        return None
 
-Return ONLY a JSON array:
-[{"id": 1, "description": "...", "agent": "coding_agent", "depends_on": []}]"""
+    # Remove markdown code blocks
+    text = re.sub(r'```(?:json)?\s*', '', text)
+    text = text.replace('```', '')
+
+    # Find first [ or {
+    start_arr = text.find('[')
+    start_obj = text.find('{')
+
+    if start_arr == -1 and start_obj == -1:
+        return None
+
+    start = min(x for x in [start_arr, start_obj] if x != -1)
+    brace = text[start]
+    ender = ']' if brace == '[' else '}'
+
+    count = 0
+    for i in range(start, len(text)):
+        if text[i] == brace:
+            count += 1
+        elif text[i] == ender:
+            count -= 1
+            if count == 0:
+                return json.loads(text[start:i+1])
+    return None
 
 
 class AutonomousPlanner:
@@ -40,18 +58,59 @@ class AutonomousPlanner:
         self.evolution = evolution_tracker
         self.tasks: List[Subtask] = []
 
+    def _build_planner_prompt(self, goal: str) -> str:
+        # Dynamically inject ONLY real agents — no hallucinations allowed
+        agent_names = list(self.agents.agents.keys())
+        valid_agents = agent_names + ["tool", "llm"]
+
+        registry_text = "\n".join(
+            f"- {name}: {agent.description}"
+            for name, agent in self.agents.agents.items()
+        )
+
+        return f"""You are JARVIS's task planner. Break the user's goal into numbered subtasks.
+
+AVAILABLE AGENTS (you MUST use ONLY these names):
+{registry_text}
+- tool: for file operations, shell commands, web search
+- llm: for direct text generation, summaries, explanations
+
+RULES:
+1. Each subtask MUST use an agent name from AVAILABLE AGENTS above.
+2. NEVER invent agent names like "direct", "system", or "user".
+3. Return ONLY a raw JSON array. No markdown, no explanations, no code fences.
+
+JSON FORMAT:
+[
+  {{"id": 1, "description": "...", "agent": "coding_agent", "depends_on": []}}
+]
+
+Goal: {goal}
+
+Subtasks:"""
+
     def plan(self, goal: str) -> List[Subtask]:
-        prompt = f"{PLANNER_PERSONA}\n\nGoal: {goal}\n\nSubtasks:"
-        response = self.llm.generate(prompt, system=PLANNER_PERSONA, max_tokens=1500)
+        prompt = self._build_planner_prompt(goal)
+        response = self.llm.generate(prompt, max_tokens=1500)
 
-        try:
-            raw_tasks = json.loads(response.strip())
-        except json.JSONDecodeError:
-            import re
-            match = re.search(r'\[.*\]', response, re.DOTALL)
-            raw_tasks = json.loads(match.group()) if match else []
+        # Extract JSON
+        raw_tasks = _extract_json(response)
+        if raw_tasks is None:
+            raw_tasks = []
 
-        self.tasks = [Subtask(**t) for t in raw_tasks if isinstance(t, dict)]
+        # Validate agent names
+        valid_agents = set(self.agents.agents.keys()) | {"tool", "llm"}
+        cleaned = []
+        for t in raw_tasks:
+            if not isinstance(t, dict):
+                continue
+            agent = t.get("agent", "")
+            if agent not in valid_agents:
+                print(f" [Planner] Rejected invalid agent '{agent}', falling back to 'llm'")
+                t["agent"] = "llm"
+            cleaned.append(t)
+
+        self.tasks = [Subtask(**t) for t in cleaned]
         return self.tasks
 
     def execute(self, goal: str, memory) -> Dict[str, Any]:
@@ -71,7 +130,7 @@ class AutonomousPlanner:
                     continue
 
             task.status = "running"
-            print(f"  [Step {task.id}] {task.description} -> {task.agent}")
+            print(f" [Step {task.id}] {task.description} -> {task.agent}")
 
             start = time.time()
             try:
@@ -128,5 +187,5 @@ class AutonomousPlanner:
         if failed:
             lines.append(f"Failed steps: {len(failed)}")
             for f in failed:
-                lines.append(f"  - Step {f.id}: {f.description}")
+                lines.append(f" - Step {f.id}: {f.description}")
         return "\n".join(lines)
