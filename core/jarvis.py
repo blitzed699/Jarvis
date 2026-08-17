@@ -53,6 +53,18 @@ class JARVISCore:
         self.voice = VoiceSynthesizer(enabled=self.config.get("voice_enabled", False))
         self.current_project = None
 
+    def _notify_dashboard(self, event_type: str, data: dict = None):
+        """Broadcast state changes to the web dashboard if running."""
+        try:
+            from dashboard.server import _broadcast
+            import asyncio
+            payload = {"type": event_type}
+            if data:
+                payload.update(data)
+            asyncio.create_task(_broadcast(payload))
+        except Exception:
+            pass
+
     def _load_tools(self) -> Dict[str, Any]:
         tools = {}
         tools_dir = os.path.join(os.path.dirname(__file__), "..", "tools")
@@ -123,6 +135,7 @@ JARVIS:"""
         if agent_name is None:
             return None
 
+        self._notify_dashboard("flare_burst", {"intensity": "high", "reason": f"agent:{agent_name}"})
         print(f"  [Delegating to {agent_name}]")
         start = time.time()
         result = self.agents.delegate(agent_name, user_input)
@@ -149,9 +162,11 @@ JARVIS:"""
         final = self.llm.generate(synthesis_prompt, system=JARVIS_PERSONA)
         self.memory.log_message("jarvis", final, tool_call=f"delegate:{agent_name}")
         self._extract_facts(user_input, final)
+        self._notify_dashboard("flare_state", {"state": "normal"})
         return final
 
     def _handle_autonomous(self, goal: str) -> str:
+        self._notify_dashboard("flare_burst", {"intensity": "high", "reason": "autonomous_plan"})
         print(f"\n  [Autonomous Planning: {goal}]")
         self.planner.tasks = []
         tasks = self.planner.plan(goal)
@@ -166,6 +181,7 @@ JARVIS:"""
         synth = f"""{JARVIS_PERSONA}\n\nYou completed a multi-step task:\n{result['summary']}\n\nRespond to the user with the outcome. Be concise.\n\nUser: {goal}\nJARVIS:"""
         final = self.llm.generate(synth, system=JARVIS_PERSONA)
         self._extract_facts(goal, final)
+        self._notify_dashboard("flare_state", {"state": "normal"})
         return final
 
     def _handle_vision(self, user_input: str) -> str:
@@ -259,22 +275,29 @@ JARVIS:"""
         return False
 
     def process(self, user_input: str) -> str:
+        self._notify_dashboard("flare_burst", {"intensity": "high", "reason": "processing"})
+
         if self._handle_command(user_input):
+            self._notify_dashboard("flare_state", {"state": "normal"})
             return ""
 
         # Vision shortcuts
         vision_triggers = ["look", "what do you see", "what is on my screen", "describe my screen", "see this"]
         if any(t in user_input.lower() for t in vision_triggers):
-            return self._handle_vision(user_input)
+            result = self._handle_vision(user_input)
+            self._notify_dashboard("flare_state", {"state": "normal"})
+            return result
 
         # Autonomous planning
         if user_input.lower().startswith("plan "):
-            goal = user_input[5:].strip()
-            return self._handle_autonomous(goal)
+            result = self._handle_autonomous(user_input[5:].strip())
+            self._notify_dashboard("flare_state", {"state": "normal"})
+            return result
 
         # Agent delegation
         agent_response = self._handle_agent_task(user_input)
         if agent_response is not None:
+            self._notify_dashboard("flare_state", {"state": "normal"})
             return agent_response
 
         # Normal tool/direct flow
@@ -301,11 +324,13 @@ JARVIS:"""
             final_response = self.llm.generate(follow_up, system=JARVIS_PERSONA)
             self.memory.log_message("jarvis", final_response, tool_call=tool_call["tool"])
             self._extract_facts(user_input, final_response)
+            self._notify_dashboard("flare_state", {"state": "normal"})
             return final_response
         else:
             self.memory.log_message("user", user_input)
             self.memory.log_message("jarvis", raw_response)
             self._extract_facts(user_input, raw_response)
+            self._notify_dashboard("flare_state", {"state": "normal"})
             return raw_response
 
     def chat_loop(self):
