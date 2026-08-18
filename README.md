@@ -35,7 +35,7 @@ pip install -r requirements.txt
 Launch JARVIS:
 
 ```bash
-python main.py
+python main.py --dashboard
 ```
 
 ══════════════════════════════════════════════
