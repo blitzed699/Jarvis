@@ -10,7 +10,7 @@ SETUP
 Clone the repository:
 
 ```bash
-git clone <your-repo-url>
+git clone github.com/blitzed699/Jarvis
 cd jarvis
 ```
 
