@@ -1,8 +1,12 @@
 import json
 import time
 import re
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, asdict
+
+# v0.4 — OVC loop integration
+from core.ovc_loop import OVCLoop
+
 
 @dataclass
 class Subtask:
@@ -54,13 +58,19 @@ class AutonomousPlanner:
         "creative_agent", "tool", "llm"
     }
 
-    def __init__(self, llm_client, agent_registry, tool_router, safety_gate, evolution_tracker):
+    # v0.4 — Accept OVC loop and world state
+    def __init__(self, llm_client, agent_registry, tool_router, safety_gate,
+                 evolution_tracker, ovc_loop=None):
         self.llm = llm_client
         self.agents = agent_registry
         self.router = tool_router
         self.safety = safety_gate
         self.evolution = evolution_tracker
         self.tasks: List[Subtask] = []
+
+        # v0.4 — Cognitive core wiring
+        self.ovc: Optional[OVCLoop] = ovc_loop
+        self.world_state = None  # Set externally by JARVISCore
 
     def _build_planner_prompt(self, goal: str) -> str:
         registry_text = "\n".join(
@@ -178,9 +188,14 @@ Subtasks:"""
         self.tasks = [Subtask(**t) for t in raw_tasks if isinstance(t, dict)]
         return self.tasks
 
+    # v0.4 — Observed execution with plan tracking and final verification
     def execute(self, goal: str, memory) -> Dict[str, Any]:
         if not self.tasks:
             self.plan(goal)
+
+        # v0.4 — Initialize plan state in world model
+        if self.world_state:
+            self.world_state.set_plan(goal, len(self.tasks))
 
         completed = []
         failed = []
@@ -192,10 +207,17 @@ Subtasks:"""
                     task.status = "failed"
                     task.result = "Dependencies not met"
                     failed.append(task)
+                    # v0.4 — Track failure in world state
+                    if self.world_state:
+                        self.world_state.update_plan_step(task.id, "failed")
                     continue
 
             task.status = "running"
             print(f" [Step {task.id}] {task.description} -> {task.agent}")
+
+            # v0.4 — Track step as running in world state
+            if self.world_state:
+                self.world_state.update_plan_step(task.id, "running")
 
             context = "\n".join(
                 f"[Previous Step {t.id}] {t.agent}: {t.result}"
@@ -204,32 +226,91 @@ Subtasks:"""
             )
 
             start = time.time()
-            try:
+
+            # v0.4 — OVC-wrapped execution
+            if self.ovc:
                 if task.agent == "tool":
-                    full_desc = f"{context}\n\nCurrent task: {task.description}" if context else task.description
-                    result = self._execute_tool_task(full_desc)
+                    def execute_step():
+                        full_desc = f"{context}\n\nCurrent task: {task.description}" if context else task.description
+                        return self._execute_tool_task(full_desc)
+
+                    ovc_result = self.ovc.execute(
+                        action_type="plan_step",
+                        action_name="tool",
+                        description=task.description,
+                        execute_fn=execute_step,
+                        expected={"success": True}
+                    )
+                    result = {
+                        "success": ovc_result.final_success,
+                        "result": str(ovc_result.action_record.actual_result)
+                    }
+
                 elif task.agent in self.agents.agents:
-                    full_task = f"{context}\n\nYour task: {task.description}" if context else task.description
-                    result = self.agents.delegate(task.agent, full_task)
+                    def execute_step():
+                        full_task = f"{context}\n\nYour task: {task.description}" if context else task.description
+                        return self.agents.delegate(task.agent, full_task)
+
+                    ovc_result = self.ovc.execute(
+                        action_type="plan_step",
+                        action_name=task.agent,
+                        description=task.description,
+                        execute_fn=execute_step,
+                        expected={"success": True}
+                    )
+                    result = {
+                        "success": ovc_result.final_success,
+                        "result": str(ovc_result.action_record.actual_result)
+                    }
                 else:
                     full_prompt = f"{context}\n\nNow do this: {task.description}" if context else task.description
                     result = {"success": True, "result": self.llm.generate(full_prompt)}
 
-                latency = int((time.time() - start) * 1000)
-                task.status = "done" if result.get("success") else "failed"
-                task.result = result.get("result", "")
-                self.evolution.log_action("planner_step", task.agent, result.get("success", False), latency, "", task.description)
+            else:
+                # v0.3 fallback — blind execution (no OVC available)
+                try:
+                    if task.agent == "tool":
+                        full_desc = f"{context}\n\nCurrent task: {task.description}" if context else task.description
+                        result = self._execute_tool_task(full_desc)
+                    elif task.agent in self.agents.agents:
+                        full_task = f"{context}\n\nYour task: {task.description}" if context else task.description
+                        result = self.agents.delegate(task.agent, full_task)
+                    else:
+                        full_prompt = f"{context}\n\nNow do this: {task.description}" if context else task.description
+                        result = {"success": True, "result": self.llm.generate(full_prompt)}
+                except Exception as e:
+                    result = {"success": False, "result": str(e)}
 
-                if result.get("success"):
-                    completed.append(task)
-                else:
-                    failed.append(task)
+            latency = int((time.time() - start) * 1000)
+            task.status = "done" if result.get("success") else "failed"
+            task.result = result.get("result", "")
 
-            except Exception as e:
-                task.status = "failed"
-                task.result = str(e)
+            # v0.4 — Track step completion in world state
+            if self.world_state:
+                status = "done" if result.get("success") else "failed"
+                self.world_state.update_plan_step(task.id, status)
+
+            self.evolution.log_action("planner_step", task.agent, result.get("success", False), latency, "", task.description)
+
+            if result.get("success"):
+                completed.append(task)
+            else:
                 failed.append(task)
-                self.evolution.log_action("planner_step", task.agent, False, 0, str(e), task.description)
+
+        # v0.4 — Final plan verification before claiming "done"
+        if self.world_state and self.ovc:
+            plan_verification = self.ovc.verifier.verify_plan_completion(
+                self.world_state.active_plan, self.world_state
+            )
+            if not plan_verification.verified:
+                return {
+                    "success": False,
+                    "goal": goal,
+                    "completed": len(completed),
+                    "failed": len(failed),
+                    "tasks": [asdict(t) for t in self.tasks],
+                    "summary": f"Plan execution had issues. {plan_verification.recommendation}"
+                }
 
         return {
             "success": len(failed) == 0,
