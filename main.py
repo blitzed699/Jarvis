@@ -4,7 +4,7 @@ from core.jarvis import JARVISCore
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="JARVIS v0.3 — Local AI Partner")
+    parser = argparse.ArgumentParser(description="JARVIS v0.4 — Cognitive AI Partner")
     parser.add_argument("--dashboard", action="store_true", help="Launch the web dashboard")
     parser.add_argument("--port", type=int, default=8080, help="Dashboard port (default: 8080)")
     args = parser.parse_args()
