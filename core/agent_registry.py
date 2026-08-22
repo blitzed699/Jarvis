@@ -47,38 +47,12 @@ DIRECT
 or
 AGENT: <agent_name>"""
 
-            def select(self, user_input: str) -> tuple:
-        desc = self.get_descriptions()
-        prompt = f"""You are JARVIS — a task router. Decide if a specialist agent should handle this request.
-
-Available agents:
-{desc}
-
-ROUTING RULES:
-- DIRECT for: greetings, small talk, questions about memory, personal info, simple facts, "what do you know", "what can you do"
-- AGENT for: specific tasks requiring expertise (coding, research, business analysis, creative design)
-
-User request: "{user_input}"
-
-Respond with EXACTLY one line:
-DIRECT
-or
-AGENT: <agent_name>"""
-
         response = self.llm.generate(prompt).strip().lower()
 
-        # Check for DIRECT first
+        # v0.4 — Strict routing to prevent false positives
         response_clean = response.strip().lower()
         if response_clean == "direct" or (response_clean.startswith("direct") and "agent:" not in response_clean):
             return None, "Direct"
-
-        # Check for agent routing
-        for name in self.agents:
-            if f"agent: {name}" in response:
-                return name, f"Routed to {name}"
-
-        # Default to direct for anything ambiguous
-        return None, "Direct"
 
         # Check for agent routing
         for name in self.agents:
