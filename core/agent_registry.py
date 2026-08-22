@@ -50,8 +50,10 @@ AGENT: <agent_name>"""
         response = self.llm.generate(prompt).strip().lower()
 
         # Check for DIRECT first
-        if "direct" in response and "agent:" not in response:
-            return None, "Direct"
+        response_clean = response.strip().lower()
+if response_clean == "direct" or (response_clean.startswith("direct") and "agent:" not in response_clean):
+    return None, "Direct"
+
 
         # Check for agent routing
         for name in self.agents:
