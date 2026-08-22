@@ -1,6 +1,7 @@
 import json
 import time
 import sys
+import re
 from typing import Dict, Any
 from .memory import JARVISMemory
 from .llm import OllamaClient
@@ -16,6 +17,8 @@ from .evolution import EvolutionTracker
 from .planner import AutonomousPlanner
 import importlib
 import os
+
+# v0.4 — Cognitive Core imports
 from core.state import WorldState
 from core.observer import Observer
 from core.verifier import Verifier
@@ -36,10 +39,13 @@ Otherwise, respond naturally in character. Do not explain that you are an AI."""
 class JARVISCore:
     def __init__(self, model: str = "llama3.1"):
         self.config = Config()
-        self.memory = JARVISMemory(
+
+        # v0.4 — Thread-safe memory
+        self.memory = ThreadSafeMemory(
             db_path=self.config.get("memory_db"),
             chroma_path=self.config.get("chroma_path")
         )
+
         self.llm = OllamaClient(
             model=self.config.get("model", model),
             base_url=self.config.get("base_url")
@@ -54,7 +60,20 @@ class JARVISCore:
         self.projects = ProjectTracker(self.memory.conn)
         self.goals = GoalTracker(self.memory.conn)
         self.evolution = EvolutionTracker(self.memory.conn)
-        self.planner = AutonomousPlanner(self.llm, self.agents, self.router, self.safety, self.evolution)
+
+        # v0.4 — Cognitive Core
+        self.world_state = WorldState()
+        self.observer = Observer(self.world_state)
+        self.verifier = Verifier(self.llm)
+        self.ovc = OVCLoop(self.llm, self.world_state, self.observer, self.verifier)
+
+        # v0.4 — Planner wired with OVC and world state
+        self.planner = AutonomousPlanner(
+            self.llm, self.agents, self.router, self.safety, self.evolution,
+            ovc_loop=self.ovc
+        )
+        self.planner.world_state = self.world_state
+
         self.voice = VoiceSynthesizer(enabled=self.config.get("voice_enabled", False))
         self.current_project = None
 
@@ -103,6 +122,9 @@ class JARVISCore:
         if active_projects:
             extra_context += "\n## Active Projects\n" + "\n".join([f"- {p['name']}: {p['status']}" for p in active_projects[:3]])
 
+        # v0.4 — Inject structured world state
+        state_summary = self.world_state.get_state_summary()
+
         prompt = f"""{JARVIS_PERSONA}
 
 {tools_desc}
@@ -110,6 +132,8 @@ class JARVISCore:
 {agents_desc}
 
 {insights}
+
+{state_summary}
 
 {context}{extra_context}
 
@@ -125,16 +149,54 @@ JARVIS:"""
         except Exception:
             pass
 
+    # v0.4 — Predict what a tool should produce
+    def _predict_tool_outcome(self, tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Predict what should happen after a tool runs."""
+        if tool_name in ("write_file", "file_read"):
+            return {"path": params.get("path"), "exists": True}
+        elif tool_name == "shell":
+            return {"command": params.get("command"), "exit_code": 0}
+        elif tool_name == "run_python":
+            return {"code": params.get("code"), "success": True}
+        elif tool_name == "file_list":
+            return {"path": params.get("path", "."), "exists": True}
+        return {}
+
+    # v0.4 — OVC-wrapped tool execution
     def _execute_with_safety(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
         tool_name = tool_call.get("tool")
         params = tool_call.get("params", {})
+
+        # Safety gate
         is_approved, reason = self.safety.check_tool_call(tool_name, params)
         if not is_approved:
             approved = self.safety.request_approval(tool_name, params, reason)
             if not approved:
                 return {"success": False, "result": "User denied approval."}
-        return self.router.execute(tool_call)
 
+        # v0.4 — OVC Loop: observe, verify, correct
+        expected = self._predict_tool_outcome(tool_name, params)
+
+        def execute_fn():
+            return self.router.execute(tool_call)
+
+        ovc_result = self.ovc.execute(
+            action_type="tool",
+            action_name=tool_name,
+            description=f"Execute {tool_name} with {params}",
+            execute_fn=execute_fn,
+            expected=expected
+        )
+
+        if ovc_result.final_success:
+            return {"success": True, "result": ovc_result.action_record.actual_result}
+        else:
+            return {
+                "success": False,
+                "result": f"{ovc_result.verification.recommendation} | Discrepancies: {ovc_result.observation.discrepancies}"
+            }
+
+    # v0.4 — OVC-wrapped agent delegation
     def _handle_agent_task(self, user_input: str) -> str:
         agent_name, reason = self.agents.select(user_input)
         if agent_name is None:
@@ -143,15 +205,45 @@ JARVIS:"""
         self._notify_dashboard("flare_burst", {"intensity": "high", "reason": f"agent:{agent_name}"})
         print(f"  [Delegating to {agent_name}]")
         start = time.time()
-        result = self.agents.delegate(agent_name, user_input)
+
+        # v0.4 — Extract file paths for coding agent verification
+        expected_files = []
+        if agent_name == "coding_agent":
+            expected_files = re.findall(r'/\S+\.\w+', user_input)
+
+        # v0.4 — OVC-wrapped agent execution
+        def execute_agent():
+            return self.agents.delegate(agent_name, user_input)
+
+        ovc_result = self.ovc.execute(
+            action_type="agent",
+            action_name=agent_name,
+            description=user_input,
+            execute_fn=execute_agent,
+            expected={"file_paths": expected_files, "success": True}
+        )
+
+        result = {
+            "success": ovc_result.final_success,
+            "result": ovc_result.action_record.actual_result.get("result", "")
+            if isinstance(ovc_result.action_record.actual_result, dict)
+            else str(ovc_result.action_record.actual_result)
+        }
         agent_output = result.get("result", "")
         latency = int((time.time() - start) * 1000)
+
+        # Track rejections in world state
+        if not ovc_result.final_success:
+            self.world_state.user.add_rejection(user_input)
 
         if agent_name != "critic_agent":
             critique = self.agents.critique(user_input, agent_output)
             verdict = critique.get("verdict", "PASS")
             print(f"  [Critic: {verdict}]")
+
+            # v0.4 — Track critic rejections in world state
             if verdict == "REJECT":
+                self.world_state.user.add_rejection(user_input)
                 self.evolution.log_action("agent", agent_name, False, latency, "Rejected by critic", user_input)
                 return "I need to reconsider that approach. Let me try again."
             elif verdict == "NEEDS_FIX":
@@ -209,6 +301,7 @@ JARVIS:"""
         if cmd == "exit":
             self.memory.end_session("User exited.")
             self.memory.close()
+            self.world_state.save_checkpoint()  # v0.4 — persist state for crash recovery
             print("JARVIS: Goodbye.")
             return True
 
@@ -340,7 +433,7 @@ JARVIS:"""
 
     def chat_loop(self):
         print("=" * 50)
-        print("JARVIS v0.3 — Local AI Partner")
+        print("JARVIS v0.4 — Local AI Partner")
         print("=" * 50)
         print("Commands: exit | tools | agents | goals | projects")
         print("          goal <title> | project <name> | voice on/off")
