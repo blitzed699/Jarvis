@@ -7,8 +7,9 @@ This is the heart of JARVIS v0.4 cognitive architecture.
 After every action:
   1. OBSERVE  — check what actually happened
   2. VERIFY   — compare against expectation
-  3. CORRECT  — if mismatch, generate and apply fix
-  4. RE-VERIFY — confirm the fix worked
+  3. CRITIC   — mandatory review for agent outputs (v0.4)
+  4. CORRECT  — if mismatch, generate and apply fix
+  5. RE-VERIFY — confirm the fix worked
 
 Without this loop, JARVIS is just an LLM with tools.
 With this loop, JARVIS becomes a reliable autonomous system.
@@ -30,6 +31,7 @@ class OVCCycleResult:
     action_record: ActionRecord
     observation: ObservationResult
     verification: VerificationResult
+    critic_verdict: Optional[str]  # v0.4 — critic result
     corrected: bool
     final_success: bool
     iterations: int
@@ -42,6 +44,7 @@ class OVCCycleResult:
             "verified": self.verification.verified,
             "confidence": self.verification.confidence,
             "severity": self.verification.severity,
+            "critic_verdict": self.critic_verdict,
             "corrected": self.corrected,
             "final_success": self.final_success,
             "iterations": self.iterations,
@@ -52,29 +55,23 @@ class OVCCycleResult:
 
 class OVCLoop:
     """
-    Observe → Verify → Correct Loop
+    Observe → Verify → Critic → Correct Loop
 
     Usage:
-        ovc = OVCLoop(llm, world_state, observer, verifier)
-        result = ovc.execute(
-            action_type="tool",
-            action_name="write_file",
-            description="Create hello.py",
-            execute_fn=lambda: tool.run(path="/tmp/hello.py", content="print(1)"),
-            expected={"path": "/tmp/hello.py", "exists": True}
-        )
-        if not result.final_success:
-            print("Failed after corrections:", result.verification.recommendation)
+        ovc = OVCLoop(llm, world_state, observer, verifier, critic_fn)
+        result = ovc.execute(...)
     """
 
     MAX_ITERATIONS = 3
 
     def __init__(self, llm_client, world_state: WorldState,
-                 observer: Observer, verifier: Verifier):
+                 observer: Observer, verifier: Verifier,
+                 critic_fn: Optional[Callable] = None):
         self.llm = llm_client
         self.state = world_state
         self.observer = observer
         self.verifier = verifier
+        self.critic_fn = critic_fn  # v0.4 — callable that runs critic agent
         self._correction_stats = {"total": 0, "successful": 0}
 
     def execute(self, action_type: str, action_name: str, description: str,
@@ -85,24 +82,10 @@ class OVCLoop:
                 project_id: Optional[str] = None) -> OVCCycleResult:
         """
         Execute an action within the OVC loop.
-
-        Args:
-            action_type: "tool" | "agent" | "llm" | "plan_step"
-            action_name: specific tool/agent name
-            description: human-readable what this action should do
-            execute_fn: zero-arg callable that performs the action
-            expected: dict describing expected outcome (for observation)
-            observe_fn: optional custom observation function
-            max_iterations: max correction attempts (default 3)
-            project_id: optional project scope
-
-        Returns:
-            OVCCycleResult with full cycle history
         """
         action_id = f"act_{int(time.time() * 1000)}_{hashlib.md5(description.encode()).hexdigest()[:4]}"
         corrections_history = []
 
-        # Record action start
         record = ActionRecord(
             id=action_id,
             action_type=action_type,
@@ -120,13 +103,12 @@ class OVCLoop:
         current_result = None
         last_observation = None
         last_verification = None
+        critic_verdict = None
 
         while iteration < max_iterations:
             iteration += 1
 
-            # ==========================================================
             # EXECUTE
-            # ==========================================================
             try:
                 start = time.time()
                 current_result = execute_fn()
@@ -152,15 +134,14 @@ class OVCLoop:
                     action_record=record,
                     observation=obs,
                     verification=ver,
+                    critic_verdict=None,
                     corrected=False,
                     final_success=False,
                     iterations=iteration,
                     corrections_history=corrections_history
                 )
 
-            # ==========================================================
             # OBSERVE
-            # ==========================================================
             if observe_fn:
                 observation = observe_fn(current_result)
             else:
@@ -170,22 +151,46 @@ class OVCLoop:
                 )
             last_observation = observation
 
-            # ==========================================================
             # VERIFY
-            # ==========================================================
             verification = self.verifier.verify(
                 expected, observation.actual,
                 observation.discrepancies, action_type, action_name
             )
             verification.action_id = action_id
+            last_verification = verification
 
-            # Update record with observation results
             record.actual_result = observation.actual
             record.discrepancies = observation.discrepancies
 
-            # ==========================================================
+            # v0.4 — MANDATORY CRITIC GATE for agent outputs
+            if verification.verified and action_type == "agent" and action_name != "critic_agent":
+                if self.critic_fn:
+                    agent_output = current_result.get("result", "") if isinstance(current_result, dict) else str(current_result)
+                    critique = self.critic_fn(description, agent_output)
+                    critic_verdict = critique.get("verdict", "PASS")
+
+                    if critic_verdict == "REJECT":
+                        record.discrepancies.insert(0, f"CRITIC REJECTED: {critique.get('review', 'Output rejected by critic')}")
+                        verification = self.verifier.verify(
+                            expected, observation.actual,
+                            record.discrepancies, action_type, action_name
+                        )
+                        verification.verified = False
+                        verification.severity = "critical"
+                        verification.recommendation = "HALT — critic rejected agent output. Regenerate from scratch."
+                        last_verification = verification
+
+                    elif critic_verdict == "NEEDS_FIX":
+                        record.discrepancies.append(f"CRITIC NEEDS_FIX: {critique.get('review', '')}")
+                        verification = self.verifier.verify(
+                            expected, observation.actual,
+                            record.discrepancies, action_type, action_name
+                        )
+                        verification.auto_correctable = True
+                        verification.correction_hint = critique.get('review', 'Address critic feedback')
+                        last_verification = verification
+
             # DECIDE: success or correct?
-            # ==========================================================
             if verification.verified:
                 record.status = ActionStatus.DONE if not corrected else ActionStatus.CORRECTED
                 record.confidence = verification.confidence
@@ -200,21 +205,18 @@ class OVCLoop:
                     action_record=record,
                     observation=observation,
                     verification=verification,
+                    critic_verdict=critic_verdict,
                     corrected=corrected,
                     final_success=True,
                     iterations=iteration,
                     corrections_history=corrections_history
                 )
 
-            # ==========================================================
-            # CORRECT (if we have retries left)
-            # ==========================================================
+            # CORRECT
             if iteration >= max_iterations:
                 break
 
-            # Check if verifier thinks this is auto-correctable
             if not verification.auto_correctable:
-                # Not auto-correctable — fail fast
                 break
 
             correction = self._generate_correction(
@@ -231,21 +233,15 @@ class OVCLoop:
                     corrections_applied=record.corrections_applied
                 )
                 self._correction_stats["total"] += 1
-                # The execute_fn for next iteration should incorporate the correction.
-                # In practice, the caller provides an execute_fn that can be retried,
-                # or the correction is applied externally and execute_fn is called again.
                 continue
             else:
                 break
 
-        # ==============================================================
-        # FAILED after max iterations or non-correctable
-        # ==============================================================
+        # FAILED
         record.status = ActionStatus.FAILED
         self.state.update_action(action_id, status=ActionStatus.FAILED)
         self.state.user.add_rejection(description)
 
-        # Use last known verification, or build a default one
         if last_verification:
             final_ver = last_verification
         else:
@@ -266,15 +262,13 @@ class OVCLoop:
                 match=False, discrepancies=["No observation available"]
             ),
             verification=final_ver,
+            critic_verdict=critic_verdict,
             corrected=corrected,
             final_success=False,
             iterations=iteration,
             corrections_history=corrections_history
         )
 
-    # ------------------------------------------------------------------
-    # Default observation routing
-    # ------------------------------------------------------------------
     def _default_observe(self, action_type: str, action_name: str,
                          description: str, result: Dict[str, Any],
                          expected: Dict[str, Any]) -> ObservationResult:
@@ -298,20 +292,17 @@ class OVCLoop:
         elif action_type == "agent":
             output = result.get("result", "")
             if action_name == "coding_agent":
-                # Coding agent: check files AND check for hallucination
                 paths = expected.get("file_paths", [])
                 file_obs = self.observer.observe_file_system(paths) if paths else None
                 output_obs = self.observer.observe_agent_output(
                     description, output,
                     expected_elements=expected.get("expected_elements", [])
                 )
-                # Merge observations
                 all_disc = []
                 if file_obs and not file_obs.match:
                     all_disc.extend(file_obs.discrepancies)
                 if not output_obs.match:
                     all_disc.extend(output_obs.discrepancies)
-                # If agent claimed to create files but they don't exist, that's CRITICAL
                 if output_obs.metadata.get("requires_verification") and paths:
                     if file_obs and not file_obs.match:
                         all_disc.insert(0, "AGENT HALLUCINATION: claimed to create files that do not exist")
@@ -344,7 +335,6 @@ class OVCLoop:
                 discrepancies=[] if result.get("success") else [result.get("result", "Step failed")]
             )
 
-        # Fallback
         return ObservationResult(
             observation_type="generic",
             target=description,
@@ -354,16 +344,12 @@ class OVCLoop:
             discrepancies=[] if result.get("success") else [result.get("result", "Unknown failure")]
         )
 
-    # ------------------------------------------------------------------
-    # Correction generation
-    # ------------------------------------------------------------------
     def _generate_correction(self, action_type: str, action_name: str,
                              description: str, result: Dict[str, Any],
                              observation: ObservationResult,
                              verification: VerificationResult) -> Optional[str]:
-        """Generate a correction strategy. Uses LLM if available, else heuristics."""
+        """Generate a correction strategy."""
 
-        # First: use verifier's hint if available
         if verification.correction_hint:
             return verification.correction_hint
 
@@ -402,7 +388,6 @@ Correction strategy (one sentence, specific and actionable):"""
 
         try:
             correction = self.llm.generate(prompt, max_tokens=150).strip()
-            # Validate: must be specific enough
             if len(correction) > 10 and not correction.lower().startswith(("fix", "try", "check")):
                 return correction
         except Exception:
