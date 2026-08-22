@@ -16,6 +16,11 @@ from .evolution import EvolutionTracker
 from .planner import AutonomousPlanner
 import importlib
 import os
+from core.state import WorldState
+from core.observer import Observer
+from core.verifier import Verifier
+from core.ovc_loop import OVCLoop
+from core.memory_threadsafe import ThreadSafeMemory
 
 
 JARVIS_PERSONA = """You are JARVIS — a calm, intelligent, and composed digital partner.
