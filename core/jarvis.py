@@ -24,6 +24,7 @@ from core.observer import Observer
 from core.verifier import Verifier
 from core.ovc_loop import OVCLoop
 from core.memory_threadsafe import ThreadSafeMemory
+from core.procedural_memory import ProceduralMemory  # v0.4 — procedural memory
 
 
 JARVIS_PERSONA = """You are JARVIS — a calm, intelligent, and composed digital partner.
@@ -65,7 +66,15 @@ class JARVISCore:
         self.world_state = WorldState()
         self.observer = Observer(self.world_state)
         self.verifier = Verifier(self.llm)
-        self.ovc = OVCLoop(self.llm, self.world_state, self.observer, self.verifier)
+
+        # v0.4 — Procedural Memory (learns from failures)
+        self.procedural_memory = ProceduralMemory(self.llm)
+
+        # v0.4 — OVC Loop with mandatory critic gate
+        self.ovc = OVCLoop(
+            self.llm, self.world_state, self.observer, self.verifier,
+            critic_fn=self._run_critic  # v0.4 — mandatory critic
+        )
 
         # v0.4 — Planner wired with OVC and world state
         self.planner = AutonomousPlanner(
@@ -76,6 +85,10 @@ class JARVISCore:
 
         self.voice = VoiceSynthesizer(enabled=self.config.get("voice_enabled", False))
         self.current_project = None
+
+    def _run_critic(self, task: str, output: str) -> Dict[str, Any]:
+        """v0.4 — Wrapper for critic agent to inject into OVC loop."""
+        return self.agents.critique(task, output)
 
     def _notify_dashboard(self, event_type: str, data: dict = None):
         """Broadcast state changes to the web dashboard if running."""
@@ -125,7 +138,12 @@ class JARVISCore:
         # v0.4 — Inject structured world state
         state_summary = self.world_state.get_state_summary()
 
+        # v0.4 — Inject learned behavioral rules from procedural memory
+        procedural_rules = self.procedural_memory.get_rules_for_prompt()
+
         prompt = f"""{JARVIS_PERSONA}
+
+{procedural_rules}
 
 {tools_desc}
 
@@ -162,6 +180,19 @@ JARVIS:"""
             return {"path": params.get("path", "."), "exists": True}
         return {}
 
+    # v0.4 — Check for recurring patterns and learn rules
+    def _check_procedural_learning(self) -> None:
+        """After actions, check if JARVIS should learn a new behavioral rule."""
+        pattern = self.world_state.get_recurring_discrepancy_pattern()
+        if pattern:
+            # Get the most recent action with this discrepancy for context
+            recent = [a for a in self.world_state.action_history if any(pattern in d for d in a.discrepancies)]
+            if recent:
+                descriptions = [a.description for a in recent[-3:]]
+                rule = self.procedural_memory.observe_discrepancy(pattern, descriptions[-1])
+                if rule and rule.trigger_count == 1:
+                    print(f"  [Procedural Memory: Learned new rule — {rule.rule_text}]")
+
     # v0.4 — OVC-wrapped tool execution
     def _execute_with_safety(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
         tool_name = tool_call.get("tool")
@@ -188,6 +219,9 @@ JARVIS:"""
             expected=expected
         )
 
+        # v0.4 — Learn from any discrepancies
+        self._check_procedural_learning()
+
         if ovc_result.final_success:
             return {"success": True, "result": ovc_result.action_record.actual_result}
         else:
@@ -211,7 +245,7 @@ JARVIS:"""
         if agent_name == "coding_agent":
             expected_files = re.findall(r'/\S+\.\w+', user_input)
 
-        # v0.4 — OVC-wrapped agent execution
+        # v0.4 — OVC-wrapped agent execution (critic is now mandatory inside OVC)
         def execute_agent():
             return self.agents.delegate(agent_name, user_input)
 
@@ -236,23 +270,21 @@ JARVIS:"""
         if not ovc_result.final_success:
             self.world_state.user.add_rejection(user_input)
 
-        if agent_name != "critic_agent":
-            critique = self.agents.critique(user_input, agent_output)
-            verdict = critique.get("verdict", "PASS")
-            print(f"  [Critic: {verdict}]")
+        # v0.4 — Learn from any discrepancies (including critic rejections)
+        self._check_procedural_learning()
 
-            # v0.4 — Track critic rejections in world state
-            if verdict == "REJECT":
-                self.world_state.user.add_rejection(user_input)
-                self.evolution.log_action("agent", agent_name, False, latency, "Rejected by critic", user_input)
-                return "I need to reconsider that approach. Let me try again."
-            elif verdict == "NEEDS_FIX":
-                self.evolution.log_action("agent", agent_name, False, latency, "Needs fix per critic", user_input)
-                fix_prompt = f"""{JARVIS_PERSONA}\n\nOriginal task: {user_input}\n\nFirst attempt had issues:\n{critique.get('review', '')}\n\nProvide a corrected response.\n\nJARVIS:"""
-                agent_output = self.llm.generate(fix_prompt, system=JARVIS_PERSONA)
-                result["result"] = agent_output
-            else:
-                self.evolution.log_action("agent", agent_name, True, latency, "", user_input)
+        # v0.4 — Critic is now handled INSIDE the OVC loop, not post-hoc
+        # The code below handles critic verdicts that came through the OVC loop
+        if ovc_result.critic_verdict == "REJECT":
+            self.evolution.log_action("agent", agent_name, False, latency, "Rejected by critic (OVC gate)", user_input)
+            return "I need to reconsider that approach. Let me try again."
+        elif ovc_result.critic_verdict == "NEEDS_FIX":
+            self.evolution.log_action("agent", agent_name, False, latency, "Needs fix per critic (OVC gate)", user_input)
+            fix_prompt = f"""{JARVIS_PERSONA}\n\nOriginal task: {user_input}\n\nFirst attempt had issues per critic review.\n\nProvide a corrected response.\n\nUser: {user_input}\nJARVIS:"""
+            agent_output = self.llm.generate(fix_prompt, system=JARVIS_PERSONA)
+            result["result"] = agent_output
+        else:
+            self.evolution.log_action("agent", agent_name, True, latency, "", user_input)
 
         self.memory.log_message("user", user_input, tool_call=f"delegate:{agent_name}")
         synthesis_prompt = f"""{JARVIS_PERSONA}\n\nYou delegated to {agent_name}. Result:\n{agent_output}\n\nRespond naturally. Summarize what was accomplished. Be concise.\n\nUser: {user_input}\nJARVIS:"""
@@ -370,6 +402,25 @@ JARVIS:"""
             print(self.evolution.get_insights())
             return True
 
+        # v0.4 — Procedural memory commands
+        if cmd == "rules":
+            rules = self.procedural_memory.get_all_rules()
+            if rules:
+                print("  Learned behavioral rules:")
+                for r in rules:
+                    print(f"    [{r['confidence']:.0%}] {r['rule']}")
+            else:
+                print("  No learned rules yet.")
+            return True
+
+        if cmd.startswith("forget rule "):
+            rule_id = user_input[12:].strip()
+            if self.procedural_memory.delete_rule(rule_id):
+                print(f"  Rule {rule_id} deleted.")
+            else:
+                print(f"  Rule {rule_id} not found.")
+            return True
+
         return False
 
     def process(self, user_input: str) -> str:
@@ -433,11 +484,12 @@ JARVIS:"""
 
     def chat_loop(self):
         print("=" * 50)
-        print("JARVIS v0.4 — Local AI Partner")
+        print("JARVIS v0.4 — Cognitive AI Partner")
         print("=" * 50)
-        print("Commands: exit | tools | agents | goals | projects")
+        print("Commands: exit | tools | agents | goals | projects | rules")
         print("          goal <title> | project <name> | voice on/off")
         print("          feedback <1-5> [comment] | insights")
+        print("          forget rule <id>  — delete a learned rule")
         print("          plan <goal>  — autonomous multi-step execution")
         print("          look / what do you see  — vision (needs llava)")
         print()
