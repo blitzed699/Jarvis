@@ -21,8 +21,6 @@ class FakeBackend:
 def test_keyword_classification():
     print("\n=== Test: Keyword Classification ===")
     mr = ModelRouter({"model": "test", "base_url": "http://localhost:11434"})
-    
-    # Inject fake backends so we don't need Ollama running
     mr.backends = {
         "local_fast": FakeBackend("fast"),
         "local_standard": FakeBackend("std"),
@@ -42,7 +40,6 @@ def test_keyword_classification():
 
     for prompt, expected in cases:
         result = mr.classify_task(prompt)
-        # Some might fall back to fallback, but coding/arch/vision/simple should be exact
         if expected in ("coding", "architecture", "vision", "simple_qa", "summarization", "verification"):
             assert result == expected, f"Failed for '{prompt}': got {result}, expected {expected}"
             print(f"  ✓ '{prompt[:40]}...' → {result}")
@@ -53,9 +50,7 @@ def test_keyword_classification():
 def test_routing_fallback():
     print("\n=== Test: Routing Fallback ===")
     mr = ModelRouter({"model": "test"})
-    mr.backends = {
-        "local_standard": FakeBackend("std"),
-    }
+    mr.backends = {"local_standard": FakeBackend("std")}
 
     result = mr.route("Hello world")
     assert result["success"] is True
@@ -69,7 +64,6 @@ def test_generate_drop_in():
     mr = ModelRouter({"model": "test"})
     mr.backends = {"local_standard": FakeBackend("std")}
 
-    # This is exactly how jarvis.py calls it
     text = mr.generate("Hello", system="You are JARVIS")
     assert "[std]" in text
     print(f"  ✓ generate() returned: {text[:40]}...")
@@ -84,7 +78,6 @@ def test_forced_backend():
         "local_strong": FakeBackend("strong"),
     }
 
-    # Force strong model for coding
     result = mr.route("Write code", force_backend="local_strong")
     assert result["backend_used"] == "local_strong"
     print(f"  ✓ Forced backend: {result['backend_used']}")
