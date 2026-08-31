@@ -48,10 +48,17 @@ class JARVISCore:
             chroma_path=self.config.get("chroma_path")
         )
 
-        self.llm = OllamaClient(
-            model=self.config.get("model", model),
-            base_url=self.config.get("base_url")
-        )
+        # v0.5 — Model Router (intelligent backend selection)
+        self.model_router = ModelRouter({
+            "model": self.config.get("model", model),
+            "fast_model": self.config.get("fast_model", "llama3.2:1b"),
+            "strong_model": self.config.get("strong_model", "qwen2.5-coder:14b"),
+            "vision_model": self.config.get("vision_model", "llava"),
+            "openai_api_key": self.config.get("openai_api_key"),
+            "base_url": self.config.get("base_url")
+        })
+        self.llm = self.model_router  # backward compat — now routes intelligently
+
         self.tools = self._load_tools()
         self.router = ToolRouter(self.tools)
         self.extractor = FactExtractor(self.llm)
@@ -403,6 +410,18 @@ JARVIS:"""
             print(self.evolution.get_insights())
             return True
 
+        # v0.5 — Model routing stats
+        if cmd == "routing":
+            stats = self.model_router.get_stats()
+            print(f"  Routing Stats:")
+            print(f"    Total requests: {stats['total_requests']}")
+            if stats['total_requests'] > 0:
+                print(f"    Avg latency: {stats['avg_latency_ms']}ms")
+                print(f"    Total cost: {stats['total_cost']} units")
+                print(f"    Backend distribution: {stats['backend_distribution']}")
+            print(f"    Available backends: {', '.join(stats['backends_available'])}")
+            return True
+
         # v0.4 — Procedural memory commands
         if cmd == "rules":
             rules = self.procedural_memory.get_all_rules()
@@ -485,11 +504,11 @@ JARVIS:"""
 
     def chat_loop(self):
         print("=" * 50)
-        print("JARVIS v0.4 — Cognitive AI Partner")
+        print("JARVIS v0.5 — Intelligent Cognitive AI Partner")
         print("=" * 50)
-        print("Commands: exit | tools | agents | goals | projects | rules")
+        print("Commands: exit | tools | agents | goals | projects | rules | routing")
         print("          goal <title> | project <name> | voice on/off")
-        print("          feedback <1-5> [comment] | insights")
+        print("          feedback <1-5> [comment] | insights | routing")
         print("          forget rule <id>  — delete a learned rule")
         print("          plan <goal>  — autonomous multi-step execution")
         print("          look / what do you see  — vision (needs llava)")
