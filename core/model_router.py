@@ -91,37 +91,30 @@ class ModelRouter:
         """Fast keyword-based classification. No LLM call needed for common cases."""
         p = prompt.lower()
 
-        # Coding keywords
         if any(k in p for k in ["def ", "class ", "import ", "function", "code:", "```python",
                                   "javascript", "script", "program", "debug", "error in",
                                   "write a python", "build an app", "create a script"]):
             return "coding"
 
-        # Architecture/planning keywords
         if any(k in p for k in ["plan", "subtask", "architecture", "design", "structure",
                                   "break into steps", "system design", "how should i"]):
             return "architecture"
 
-        # Vision keywords
         if any(k in p for k in ["look at", "screen", "image", "photo", "vision",
                                   "see this", "what do you see", "describe this"]):
             return "vision"
 
-        # Verification keywords
         if any(k in p for k in ["verify", "check if", "test", "did it work",
                                   "confirm", "validate"]):
             return "verification"
 
-        # Simple Q&A
         if any(k in p for k in ["what is", "who is", "when", "where", "how many",
                                   "define", "explain", "tell me about"]):
             return "simple_qa"
 
-        # Summarization
         if any(k in p for k in ["summarize", "summary", "tl;dr", "condense", "key points"]):
             return "summarization"
 
-        # Fallback to LLM classifier for ambiguous cases
         classifier = self.backends.get("local_fast") or self.backends.get("local_standard")
         if not classifier:
             return "fallback"
