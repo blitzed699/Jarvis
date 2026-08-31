@@ -5,6 +5,7 @@ import re
 from typing import Dict, Any
 from .memory import JARVISMemory
 from .llm import OllamaClient
+from core.model_router import ModelRouter  # v0.5 — intelligent routing
 from .router import ToolRouter
 from .extractor import FactExtractor
 from .safety import SafetyGate
