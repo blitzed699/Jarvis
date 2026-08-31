@@ -6,6 +6,11 @@ from typing import Dict, Any
 DEFAULT_CONFIG = {
     "model": "llama3.1",
     "base_url": "http://localhost:11434",
+    "fast_model": "llama3.2:1b",
+    "strong_model": "qwen2.5-coder:14b",
+    "vision_model": "llava",
+    "openai_api_key": None,
+    "cloud_model": "gpt-4o-mini",
     "voice_enabled": False,
     "auto_approve_readonly": True,
     "memory_db": "memory/jarvis_memory.db",
@@ -15,6 +20,7 @@ DEFAULT_CONFIG = {
     "working_memory_recent": 10,
     "working_memory_relevant": 5,
 }
+
 
 
 class Config:
