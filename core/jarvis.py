@@ -27,6 +27,12 @@ from core.ovc_loop import OVCLoop
 from core.memory_threadsafe import ThreadSafeMemory
 from core.procedural_memory import ProceduralMemory  # v0.4 — procedural memory
 
+# v0.5 — Tier 2 Intelligence Amplification
+from core.replanning import ReplanningEngine
+from core.scheduler import BackgroundScheduler
+from core.knowledge_graph import KnowledgeGraph
+from core.temporal import TemporalReasoner
+
 
 JARVIS_PERSONA = """You are JARVIS — a calm, intelligent, and composed digital partner.
 You assist your owner with precision and care. You remember past conversations and preferences.
@@ -90,6 +96,20 @@ class JARVISCore:
             ovc_loop=self.ovc
         )
         self.planner.world_state = self.world_state
+
+        # v0.5 — Tier 2: Replanning Engine
+        self.replanner = ReplanningEngine(
+            self.llm, self.planner, self.world_state, self.ovc
+        )
+
+        # v0.5 — Tier 2: Background Scheduler
+        self.scheduler = BackgroundScheduler(jarvis_core=self)
+
+        # v0.5 — Tier 2: Knowledge Graph
+        self.knowledge_graph = KnowledgeGraph()
+
+        # v0.5 — Tier 2: Temporal Reasoner
+        self.temporal = TemporalReasoner()
 
         self.voice = VoiceSynthesizer(enabled=self.config.get("voice_enabled", False))
         self.current_project = None
@@ -193,7 +213,6 @@ JARVIS:"""
         """After actions, check if JARVIS should learn a new behavioral rule."""
         pattern = self.world_state.get_recurring_discrepancy_pattern()
         if pattern:
-            # Get the most recent action with this discrepancy for context
             recent = [a for a in self.world_state.action_history if any(pattern in d for d in a.discrepancies)]
             if recent:
                 descriptions = [a.description for a in recent[-3:]]
@@ -282,7 +301,6 @@ JARVIS:"""
         self._check_procedural_learning()
 
         # v0.4 — Critic is now handled INSIDE the OVC loop, not post-hoc
-        # The code below handles critic verdicts that came through the OVC loop
         if ovc_result.critic_verdict == "REJECT":
             self.evolution.log_action("agent", agent_name, False, latency, "Rejected by critic (OVC gate)", user_input)
             return "I need to reconsider that approach. Let me try again."
@@ -302,6 +320,7 @@ JARVIS:"""
         self._notify_dashboard("flare_state", {"state": "normal"})
         return final
 
+    # v0.5 — Replanning-aware autonomous execution
     def _handle_autonomous(self, goal: str) -> str:
         self._notify_dashboard("flare_burst", {"intensity": "high", "reason": "autonomous_plan"})
         print(f"\n  [Autonomous Planning: {goal}]")
@@ -310,16 +329,173 @@ JARVIS:"""
         print(f"  [Plan: {len(tasks)} steps]")
         for t in tasks:
             print(f"    Step {t.id}: {t.description} ({t.agent})")
-        result = self.planner.execute(goal, self.memory)
+
+        # v0.5 — Execute with replanning on failure
+        result = self._execute_plan_with_replanning(goal, tasks)
+
         if self.current_project:
-            self.projects.log(self.current_project, self.memory.current_session_id, f"Autonomous task: {goal} -> {result['summary']}")
+            self.projects.log(self.current_project, self.memory.current_session_id,
+                              f"Autonomous task: {goal} -> {result['summary']}")
         self.memory.log_message("user", f"plan: {goal}")
         self.memory.log_message("jarvis", result["summary"], tool_call="planner")
         synth = f"""{JARVIS_PERSONA}\n\nYou completed a multi-step task:\n{result['summary']}\n\nRespond to the user with the outcome. Be concise.\n\nUser: {goal}\nJARVIS:"""
         final = self.llm.generate(synth, system=JARVIS_PERSONA)
         self._extract_facts(goal, final)
+
+        # v0.5 — Extract knowledge graph entities from the plan result
+        self.knowledge_graph.extract_from_text(result["summary"], self.llm)
+
         self._notify_dashboard("flare_state", {"state": "normal"})
         return final
+
+    def _execute_plan_with_replanning(self, goal: str, tasks) -> Dict[str, Any]:
+        """Execute a plan with automatic replanning on step failure."""
+        from core.planner import Subtask
+
+        completed = []
+        failed = []
+        attempt_counts = {}
+
+        i = 0
+        while i < len(tasks):
+            task = tasks[i]
+            attempt_counts[task.id] = attempt_counts.get(task.id, 0) + 1
+
+            if task.depends_on:
+                pending = [t for t in tasks if t.id in task.depends_on and t.status != "done"]
+                if pending:
+                    task.status = "failed"
+                    task.result = "Dependencies not met"
+                    failed.append(task)
+                    if self.world_state:
+                        self.world_state.update_plan_step(task.id, "failed")
+                    i += 1
+                    continue
+
+            task.status = "running"
+            print(f" [Step {task.id}] {task.description} -> {task.agent}")
+            if self.world_state:
+                self.world_state.update_plan_step(task.id, "running")
+
+            context = "\n".join(
+                f"[Previous Step {t.id}] {t.agent}: {t.result}"
+                for t in tasks if t.status == "done" and t.result
+            )
+
+            start = time.time()
+            ovc_result = None
+
+            if self.ovc and task.agent in ("tool", "coding_agent", "research_agent",
+                                            "business_agent", "creative_agent", "llm"):
+                if task.agent == "tool":
+                    def execute_step():
+                        full = f"{context}\n\nCurrent task: {task.description}" if context else task.description
+                        return self.planner._execute_tool_task(full)
+                    ovc_result = self.ovc.execute(
+                        action_type="plan_step", action_name="tool",
+                        description=task.description, execute_fn=execute_step,
+                        expected={"success": True}
+                    )
+                    result = {"success": ovc_result.final_success,
+                              "result": str(ovc_result.action_record.actual_result)}
+                elif task.agent in self.agents.agents:
+                    def execute_step():
+                        full = f"{context}\n\nYour task: {task.description}" if context else task.description
+                        return self.agents.delegate(task.agent, full)
+                    ovc_result = self.ovc.execute(
+                        action_type="plan_step", action_name=task.agent,
+                        description=task.description, execute_fn=execute_step,
+                        expected={"success": True}
+                    )
+                    result = {"success": ovc_result.final_success,
+                              "result": str(ovc_result.action_record.actual_result)}
+                else:
+                    full = f"{context}\n\nNow do this: {task.description}" if context else task.description
+                    result = {"success": True, "result": self.llm.generate(full)}
+            else:
+                try:
+                    if task.agent == "tool":
+                        full = f"{context}\n\nCurrent task: {task.description}" if context else task.description
+                        result = self.planner._execute_tool_task(full)
+                    elif task.agent in self.agents.agents:
+                        full = f"{context}\n\nYour task: {task.description}" if context else task.description
+                        result = self.agents.delegate(task.agent, full)
+                    else:
+                        full = f"{context}\n\nNow do this: {task.description}" if context else task.description
+                        result = {"success": True, "result": self.llm.generate(full)}
+                except Exception as e:
+                    result = {"success": False, "result": str(e)}
+
+            latency = int((time.time() - start) * 1000)
+            task.status = "done" if result.get("success") else "failed"
+            task.result = result.get("result", "")
+
+            if self.world_state:
+                self.world_state.update_plan_step(task.id, "done" if result.get("success") else "failed")
+            self.evolution.log_action("planner_step", task.agent,
+                                       result.get("success", False), latency, "", task.description)
+
+            if result.get("success"):
+                completed.append(task)
+                i += 1
+            else:
+                failed.append(task)
+                discrepancies = []
+                if ovc_result:
+                    discrepancies = ovc_result.observation.discrepancies
+
+                recovery_plan, analysis = self.replanner.execute_recovery(
+                    goal, task, result, discrepancies,
+                    completed, tasks[i+1:], attempt_counts[task.id]
+                )
+
+                print(f"  [Replanning] {recovery_plan.strategy.value}: {recovery_plan.reason}")
+
+                if recovery_plan.strategy.value == "abort":
+                    break
+                elif recovery_plan.strategy.value == "skip":
+                    task.status = "skipped"
+                    i += 1
+                elif recovery_plan.strategy.value == "retry":
+                    task.status = "pending"
+                    continue
+                elif recovery_plan.strategy.value in ("retry_with_fix", "substitute", "replan_from"):
+                    if recovery_plan.new_steps:
+                        new_subtasks = [Subtask(**s) for s in recovery_plan.new_steps]
+                        offset = max(t.id for t in tasks) + 10
+                        for ns in new_subtasks:
+                            ns.id += offset
+                        tasks = tasks[:i] + new_subtasks + tasks[i+1:]
+                        for ns in new_subtasks:
+                            attempt_counts[ns.id] = 0
+                        continue
+                    else:
+                        i += 1
+                else:
+                    i += 1
+
+        if self.world_state and self.ovc:
+            plan_verification = self.ovc.verifier.verify_plan_completion(
+                self.world_state.active_plan, self.world_state
+            )
+            if not plan_verification.verified:
+                return {
+                    "success": False, "goal": goal,
+                    "completed": len(completed), "failed": len(failed),
+                    "tasks": [{"id": t.id, "description": t.description,
+                               "status": t.status, "agent": t.agent} for t in tasks],
+                    "summary": f"Plan execution had issues. {plan_verification.recommendation}"
+                }
+
+        return {
+            "success": len(failed) == 0,
+            "goal": goal,
+            "completed": len(completed),
+            "failed": len(failed),
+            "tasks": [{"id": t.id, "description": t.description,
+                       "status": t.status, "agent": t.agent} for t in tasks],
+            "summary": self.planner._summarize(completed, failed)
+        }
 
     def _handle_vision(self, user_input: str) -> str:
         """Handle vision requests directly."""
@@ -341,7 +517,8 @@ JARVIS:"""
         if cmd == "exit":
             self.memory.end_session("User exited.")
             self.memory.close()
-            self.world_state.save_checkpoint()  # v0.4 — persist state for crash recovery
+            self.world_state.save_checkpoint()
+            self.scheduler.stop()
             print("JARVIS: Goodbye.")
             return True
 
@@ -441,6 +618,120 @@ JARVIS:"""
                 print(f"  Rule {rule_id} not found.")
             return True
 
+        # v0.5 — Scheduler commands
+        if cmd == "jobs":
+            jobs = self.scheduler.list_jobs()
+            if jobs:
+                print(f"  Scheduled jobs ({len(jobs)}):")
+                for j in jobs:
+                    status_icon = "●" if j.status == "pending" else "○" if j.status == "completed" else "✗"
+                    next_run = j.next_run or "N/A"
+                    print(f"    {status_icon} [{j.id}] {j.name} ({j.job_type}) — next: {next_run}")
+            else:
+                print("  No scheduled jobs.")
+            return True
+
+        if cmd.startswith("schedule "):
+            rest = user_input[9:].strip()
+            parsed = self.scheduler.parse_natural_schedule(rest)
+            if parsed:
+                task_desc = rest
+                job_type = "reminder"
+                job_args = {"message": task_desc}
+
+                if any(k in rest.lower() for k in ["code", "script", "python", "build"]):
+                    job_type = "agent"
+                    job_args = {"agent": "coding_agent", "task": task_desc}
+                elif any(k in rest.lower() for k in ["research", "find", "search"]):
+                    job_type = "agent"
+                    job_args = {"agent": "research_agent", "task": task_desc}
+                elif any(k in rest.lower() for k in ["shell", "command", "run"]):
+                    job_type = "shell"
+                    job_args = {"command": task_desc}
+
+                jid = self.scheduler.add_job(
+                    name=task_desc[:40],
+                    trigger=parsed["trigger"],
+                    trigger_args=parsed["trigger_args"],
+                    job_type=job_type,
+                    job_args=job_args
+                )
+                print(f"  Scheduled: {jid} — {task_desc[:50]}")
+            else:
+                print("  Could not parse schedule. Try: 'every 5 minutes check email'")
+            return True
+
+        if cmd.startswith("cancel "):
+            job_id = user_input[7:].strip()
+            if self.scheduler.cancel_job(job_id):
+                print(f"  Cancelled job {job_id}")
+            else:
+                print(f"  Job {job_id} not found")
+            return True
+
+        # v0.5 — Knowledge Graph commands
+        if cmd.startswith("kg add "):
+            rest = user_input[7:].strip()
+            m = re.match(r'(.+?)\s+is\s+a\s+(.+)', rest, re.I)
+            if m:
+                name, etype = m.group(1).strip(), m.group(2).strip()
+                self.knowledge_graph.add_entity(name, etype)
+                print(f"  Added entity: {name} ({etype})")
+            else:
+                m = re.match(r'(.+?)\s+(uses|depends on|created by|part of|requires)\s+(.+)', rest, re.I)
+                if m:
+                    from_name, rel, to_name = m.group(1).strip(), m.group(2).strip().replace(" ", "_"), m.group(3).strip()
+                    self.knowledge_graph.add_relation(from_name, rel, to_name)
+                    print(f"  Added relation: {from_name} {rel} {to_name}")
+                else:
+                    print("  Usage: kg add <name> is a <type>")
+                    print("         kg add <name> uses <other>")
+            return True
+
+        if cmd.startswith("kg query "):
+            query = user_input[9:].strip()
+            results = self.knowledge_graph.query(entity_name=query)
+            if results["entities"] or results["relations"]:
+                print(f"  Knowledge Graph results for '{query}':")
+                for e in results["entities"][:5]:
+                    print(f"    📦 {e['name']} ({e['type']})")
+                for r in results["relations"][:5]:
+                    print(f"    🔗 {r['from_name']} {r['relation']} {r['to_name']}")
+            else:
+                print(f"  No knowledge found for '{query}'")
+            return True
+
+        if cmd == "kg stats":
+            stats = self.knowledge_graph.get_stats()
+            print(f"  Knowledge Graph: {stats['entities']} entities, {stats['relations']} relations")
+            if stats['entity_types']:
+                print("  Entity types:", ", ".join(f"{k}:{v}" for k, v in stats['entity_types'].items()))
+            return True
+
+        if cmd.startswith("kg summarize "):
+            name = user_input[13:].strip()
+            summary = self.knowledge_graph.summarize_entity(name)
+            print(summary)
+            return True
+
+        # v0.5 — Temporal / Deadline commands
+        if cmd.startswith("deadline "):
+            rest = user_input[9:].strip()
+            expr = self.temporal.parse(rest)
+            if expr and expr.target_datetime:
+                status = self.temporal.time_until(expr.target_datetime)
+                print(f"  Deadline: {expr.description}")
+                print(f"  Status: {status['text']}")
+                self.memory.store_fact(f"Deadline: {rest} — {status['text']}", category="deadline")
+            else:
+                print("  Could not parse deadline. Try: 'deadline 2026-09-15' or 'deadline next Friday'")
+            return True
+
+        if cmd == "replan stats":
+            stats = self.replanner.get_stats()
+            print(f"  Replanning stats: {stats}")
+            return True
+
         return False
 
     def process(self, user_input: str) -> str:
@@ -493,12 +784,32 @@ JARVIS:"""
             final_response = self.llm.generate(follow_up, system=JARVIS_PERSONA)
             self.memory.log_message("jarvis", final_response, tool_call=tool_call["tool"])
             self._extract_facts(user_input, final_response)
+
+            # v0.5 — Extract knowledge graph entities from conversation
+            try:
+                self.knowledge_graph.extract_from_text(
+                    f"User: {user_input}\nJARVIS: {final_response}",
+                    self.llm
+                )
+            except Exception:
+                pass
+
             self._notify_dashboard("flare_state", {"state": "normal"})
             return final_response
         else:
             self.memory.log_message("user", user_input)
             self.memory.log_message("jarvis", raw_response)
             self._extract_facts(user_input, raw_response)
+
+            # v0.5 — Extract knowledge graph entities from conversation
+            try:
+                self.knowledge_graph.extract_from_text(
+                    f"User: {user_input}\nJARVIS: {raw_response}",
+                    self.llm
+                )
+            except Exception:
+                pass
+
             self._notify_dashboard("flare_state", {"state": "normal"})
             return raw_response
 
@@ -508,11 +819,24 @@ JARVIS:"""
         print("=" * 50)
         print("Commands: exit | tools | agents | goals | projects | rules | routing")
         print("          goal <title> | project <name> | voice on/off")
-        print("          feedback <1-5> [comment] | insights | routing")
+        print("          feedback <1-5> [comment] | insights")
         print("          forget rule <id>  — delete a learned rule")
         print("          plan <goal>  — autonomous multi-step execution")
         print("          look / what do you see  — vision (needs llava)")
+        print("  —— Tier 2 ——")
+        print("          schedule <task> every N minutes/hours/days")
+        print("          schedule <task> at HH:MM | in N minutes")
+        print("          schedule <task> every Monday at 9am")
+        print("          jobs  — list scheduled jobs")
+        print("          cancel <job_id>")
+        print("          kg add <name> is a <type>")
+        print("          kg add <name> uses <other>")
+        print("          kg query <name> | kg stats | kg summarize <name>")
+        print("          deadline <time expression>")
+        print("          replan stats")
         print()
+
+        self.scheduler.start()
 
         while True:
             try:
@@ -530,6 +854,7 @@ JARVIS:"""
                 print("\nJARVIS: Session interrupted.")
                 self.memory.end_session("Interrupted.")
                 self.memory.close()
+                self.scheduler.stop()
                 break
             except Exception as e:
                 print(f"[SYSTEM ERROR] {e}")
