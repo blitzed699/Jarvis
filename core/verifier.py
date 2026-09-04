@@ -2,11 +2,7 @@
 core/verifier.py
 
 The Verification Engine — JARVIS's quality control.
-Compares expected vs actual outcomes and decides:
-- Did the action truly succeed?
-- How confident are we?
-- Should we block progress?
-- What correction is needed?
+v0.4.1: Critic NEEDS_FIX is now blocking. Only severity="none" = verified.
 """
 
 from typing import Dict, Any, List, Optional
@@ -17,13 +13,14 @@ from dataclasses import dataclass, field
 class VerificationResult:
     """Result of verifying an action against its expected outcome."""
     action_id: str
-    verified: bool          # True if action achieved its goal
-    confidence: float       # 0.0 → 1.0
+    verified: bool
+    confidence: float
     discrepancies: List[str]
-    severity: str           # "none" | "minor" | "major" | "critical"
-    recommendation: str     # What to do next
+    severity: str
+    recommendation: str
     auto_correctable: bool = False
     correction_hint: str = ""
+    evidence: List[Dict[str, Any]] = field(default_factory=list)
 
     def is_blocking(self) -> bool:
         """Should this discrepancy block progress?"""
@@ -31,7 +28,7 @@ class VerificationResult:
 
     def is_trustworthy(self) -> bool:
         """Can JARVIS claim this action succeeded?"""
-        return self.verified and self.confidence >= 0.8
+        return self.verified and self.confidence >= 0.8 and self.severity == "none"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -41,6 +38,7 @@ class VerificationResult:
             "severity": self.severity,
             "recommendation": self.recommendation,
             "discrepancies": self.discrepancies,
+            "evidence_count": len(self.evidence),
         }
 
 
@@ -59,8 +57,12 @@ class Verifier:
         """
         Verify whether an action achieved its goal.
 
-        Returns a VerificationResult with severity assessment and recommendation.
+        CRITICAL RULE: If critic injected a NEEDS_FIX discrepancy, severity is ALWAYS critical.
+        Only severity="none" with zero discrepancies = verified.
         """
+        # Check for critic-injected discrepancies first
+        has_critic_issue = any(d.startswith("CRITIC") for d in discrepancies)
+
         if not discrepancies:
             return VerificationResult(
                 action_id="",
@@ -81,9 +83,20 @@ class Verifier:
             discrepancies, action_type, action_name
         )
 
+        # v0.4.1: Critic issues are ALWAYS blocking
+        if has_critic_issue:
+            severity = "critical"
+            confidence = 0.0
+            auto_correctable = True
+            hint = "Address critic feedback and regenerate output"
+            recommendation = "HALT — critic identified issues. Fix and re-criticize before claiming success."
+
+        # v0.4.1: Only "none" = verified. "minor" is no longer auto-pass.
+        verified = severity == "none" and not has_critic_issue
+
         return VerificationResult(
             action_id="",
-            verified=severity in ("none", "minor"),
+            verified=verified,
             confidence=confidence,
             discrepancies=discrepancies,
             severity=severity,
@@ -93,10 +106,7 @@ class Verifier:
         )
 
     def verify_plan_completion(self, plan_state, world_state) -> VerificationResult:
-        """
-        Verify whether a completed plan actually achieved its goal.
-        This is the FINAL gate before JARVIS claims "done".
-        """
+        """Verify whether a completed plan actually achieved its goal."""
         if not plan_state:
             return VerificationResult(
                 action_id="plan",
@@ -120,7 +130,6 @@ class Verifier:
                 recommendation="Complete remaining steps before claiming success"
             )
 
-        # Check for any failures in action history related to this plan
         recent_failures = world_state.get_recent_failures(n=5)
         if recent_failures:
             return VerificationResult(
@@ -131,11 +140,10 @@ class Verifier:
                     f"Recent failure: {a.description} ({a.discrepancies[0] if a.discrepancies else 'unknown'})"
                     for a in recent_failures
                 ],
-                severity="major",
+                severity="critical",
                 recommendation="Review and fix failures before claiming completion"
             )
 
-        # Check for uncorrected discrepancies
         recent_with_issues = [
             a for a in world_state.action_history[-10:]
             if a.discrepancies and a.status.value != "corrected"
@@ -149,7 +157,7 @@ class Verifier:
                     f"Uncorrected issue in {a.action_name}: {a.discrepancies[0]}"
                     for a in recent_with_issues
                 ],
-                severity="major",
+                severity="critical",
                 recommendation="Address uncorrected issues before claiming completion"
             )
 
@@ -162,17 +170,14 @@ class Verifier:
             recommendation="Plan completed and verified. You may report success."
         )
 
-    # ------------------------------------------------------------------
-    # Internal assessment methods
-    # ------------------------------------------------------------------
     def _assess_severity(self, discrepancies: List[str], action_type: str,
                          action_name: str) -> str:
-        """Categorize severity based on discrepancy content and action type."""
+        """Categorize severity. Critic issues are handled upstream."""
         critical_patterns = [
             "does not exist", "execution failed", "timed out",
             "permission denied", "cannot read", "cannot write",
             "connection refused", "no such file", "not found",
-            "segmentation fault", "killed", "abort"
+            "segmentation fault", "killed", "abort", "hallucination"
         ]
         major_patterns = [
             "not found", "mismatch", "missing", "error", "failed",
@@ -180,6 +185,8 @@ class Verifier:
         ]
 
         for d in discrepancies:
+            if d.startswith("CRITIC"):
+                continue  # Handled upstream
             d_lower = d.lower()
             if any(p in d_lower for p in critical_patterns):
                 return "critical"
@@ -190,13 +197,12 @@ class Verifier:
 
     def _calculate_confidence(self, discrepancies: List[str], severity: str) -> float:
         """Calculate confidence score based on discrepancies."""
-        base = {"none": 1.0, "minor": 0.75, "major": 0.35, "critical": 0.05}.get(severity, 0.5)
+        base = {"none": 1.0, "minor": 0.6, "major": 0.25, "critical": 0.05}.get(severity, 0.5)
         penalty = min(len(discrepancies) * 0.08, 0.25)
         return max(0.0, base - penalty)
 
     def _generate_recommendation(self, severity: str, discrepancies: List[str],
-                                  action_type: str, action_name: str) -> str:
-        """Generate a concrete recommendation for how to proceed."""
+                                 action_type: str, action_name: str) -> str:
         if severity == "none":
             return "Continue"
 
@@ -215,19 +221,14 @@ class Verifier:
 
         # critical
         if action_type == "agent" and action_name == "coding_agent":
-            return "HALT — code is broken. Debug and fix before proceeding. Do not claim success."
+            return "HALT — code is broken or critic rejected. Debug, fix, and re-criticize before proceeding."
         elif action_type == "tool":
             return "HALT — tool failed critically. Check environment, permissions, and inputs."
         else:
             return "HALT — critical failure. Replan from last known good state."
 
     def _assess_auto_correctable(self, discrepancies: List[str],
-                                  action_type: str, action_name: str) -> tuple:
-        """
-        Determine if the failure is auto-correctable and provide a hint.
-        Returns (is_correctable, hint).
-        """
-        # Common auto-correctable patterns
+                                 action_type: str, action_name: str) -> tuple:
         correctable_patterns = {
             "does not exist": (True, "Check path spelling and ensure parent directories exist"),
             "permission denied": (True, "Check file permissions or use sudo if appropriate"),
