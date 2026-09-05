@@ -5,7 +5,7 @@ import re
 from typing import Dict, Any
 from .memory import JARVISMemory
 from .llm import OllamaClient
-from core.model_router import ModelRouter  # v0.5 — intelligent routing
+from core.model_router import ModelRouter
 from .router import ToolRouter
 from .extractor import FactExtractor
 from .safety import SafetyGate
@@ -19,20 +19,18 @@ from .planner import AutonomousPlanner
 import importlib
 import os
 
-# v0.4 — Cognitive Core imports
 from core.state import WorldState
 from core.observer import Observer
 from core.verifier import Verifier
 from core.ovc_loop import OVCLoop
 from core.memory_threadsafe import ThreadSafeMemory
-from core.procedural_memory import ProceduralMemory  # v0.4 — procedural memory
+from core.procedural_memory import ProceduralMemory
 
-# v0.5 — Tier 2 Intelligence Amplification
 from core.replanning import ReplanningEngine
 from core.scheduler import BackgroundScheduler
 from core.knowledge_graph import KnowledgeGraph
 from core.temporal import TemporalReasoner
-
+from core.execution_broker import ExecutionBroker
 
 JARVIS_PERSONA = """You are JARVIS — a calm, intelligent, and composed digital partner.
 You assist your owner with precision and care. You remember past conversations and preferences.
@@ -54,7 +52,7 @@ class JARVISCore:
             chroma_path=self.config.get("chroma_path")
         )
 
-        # v0.5 — Model Router (intelligent backend selection)
+        # v0.5 — Model Router
         self.model_router = ModelRouter({
             "model": self.config.get("model", model),
             "fast_model": self.config.get("fast_model", "llama3.2:1b"),
@@ -63,7 +61,7 @@ class JARVISCore:
             "openai_api_key": self.config.get("openai_api_key"),
             "base_url": self.config.get("base_url")
         })
-        self.llm = self.model_router  # backward compat — now routes intelligently
+        self.llm = self.model_router
 
         self.tools = self._load_tools()
         self.router = ToolRouter(self.tools)
@@ -81,14 +79,22 @@ class JARVISCore:
         self.observer = Observer(self.world_state)
         self.verifier = Verifier(self.llm)
 
-        # v0.4 — Procedural Memory (learns from failures)
+        # v0.4 — Procedural Memory
         self.procedural_memory = ProceduralMemory(self.llm)
 
-        # v0.4 — OVC Loop with mandatory critic gate
+        # v0.4 — OVC Loop with proper critic integration
         self.ovc = OVCLoop(
             self.llm, self.world_state, self.observer, self.verifier,
-            critic_fn=self._run_critic  # v0.4 — mandatory critic
+            critic_fn=self._run_critic
         )
+
+        # NEW: Execution Broker — central gateway for ALL execution
+        self.broker = ExecutionBroker(
+            self.router, self.safety, self.ovc, self.world_state
+        )
+
+        # Inject broker into agents so they can't bypass safety
+        self.agents.broker = self.broker
 
         # v0.4 — Planner wired with OVC and world state
         self.planner = AutonomousPlanner(
@@ -97,18 +103,12 @@ class JARVISCore:
         )
         self.planner.world_state = self.world_state
 
-        # v0.5 — Tier 2: Replanning Engine
+        # v0.5 — Tier 2
         self.replanner = ReplanningEngine(
             self.llm, self.planner, self.world_state, self.ovc
         )
-
-        # v0.5 — Tier 2: Background Scheduler
         self.scheduler = BackgroundScheduler(jarvis_core=self)
-
-        # v0.5 — Tier 2: Knowledge Graph
         self.knowledge_graph = KnowledgeGraph()
-
-        # v0.5 — Tier 2: Temporal Reasoner
         self.temporal = TemporalReasoner()
 
         self.voice = VoiceSynthesizer(enabled=self.config.get("voice_enabled", False))
@@ -119,7 +119,6 @@ class JARVISCore:
         return self.agents.critique(task, output)
 
     def _notify_dashboard(self, event_type: str, data: dict = None):
-        """Broadcast state changes to the web dashboard if running."""
         try:
             from dashboard.server import _broadcast
             import asyncio
@@ -163,10 +162,7 @@ class JARVISCore:
         if active_projects:
             extra_context += "\n## Active Projects\n" + "\n".join([f"- {p['name']}: {p['status']}" for p in active_projects[:3]])
 
-        # v0.4 — Inject structured world state
         state_summary = self.world_state.get_state_summary()
-
-        # v0.4 — Inject learned behavioral rules from procedural memory
         procedural_rules = self.procedural_memory.get_rules_for_prompt()
 
         prompt = f"""{JARVIS_PERSONA}
@@ -195,22 +191,7 @@ JARVIS:"""
         except Exception:
             pass
 
-    # v0.4 — Predict what a tool should produce
-    def _predict_tool_outcome(self, tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Predict what should happen after a tool runs."""
-        if tool_name in ("write_file", "file_read"):
-            return {"path": params.get("path"), "exists": True}
-        elif tool_name == "shell":
-            return {"command": params.get("command"), "exit_code": 0}
-        elif tool_name == "run_python":
-            return {"code": params.get("code"), "success": True}
-        elif tool_name == "file_list":
-            return {"path": params.get("path", "."), "exists": True}
-        return {}
-
-    # v0.4 — Check for recurring patterns and learn rules
     def _check_procedural_learning(self) -> None:
-        """After actions, check if JARVIS should learn a new behavioral rule."""
         pattern = self.world_state.get_recurring_discrepancy_pattern()
         if pattern:
             recent = [a for a in self.world_state.action_history if any(pattern in d for d in a.discrepancies)]
@@ -220,44 +201,20 @@ JARVIS:"""
                 if rule and rule.trigger_count == 1:
                     print(f"  [Procedural Memory: Learned new rule — {rule.rule_text}]")
 
-    # v0.4 — OVC-wrapped tool execution
+    # ==================================================================
+    # v0.4.1: ALL tool execution routes through the broker
+    # ==================================================================
     def _execute_with_safety(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
-        tool_name = tool_call.get("tool")
-        params = tool_call.get("params", {})
-
-        # Safety gate
-        is_approved, reason = self.safety.check_tool_call(tool_name, params)
-        if not is_approved:
-            approved = self.safety.request_approval(tool_name, params, reason)
-            if not approved:
-                return {"success": False, "result": "User denied approval."}
-
-        # v0.4 — OVC Loop: observe, verify, correct
-        expected = self._predict_tool_outcome(tool_name, params)
-
-        def execute_fn():
-            return self.router.execute(tool_call)
-
-        ovc_result = self.ovc.execute(
-            action_type="tool",
-            action_name=tool_name,
-            description=f"Execute {tool_name} with {params}",
-            execute_fn=execute_fn,
-            expected=expected
+        """Execute a tool through the central broker (safety + OVC + evidence)."""
+        return self.broker.execute_tool(
+            tool_call,
+            description=f"Execute {tool_call.get('tool')} with {tool_call.get('params')}",
+            project_id=self.current_project
         )
 
-        # v0.4 — Learn from any discrepancies
-        self._check_procedural_learning()
-
-        if ovc_result.final_success:
-            return {"success": True, "result": ovc_result.action_record.actual_result}
-        else:
-            return {
-                "success": False,
-                "result": f"{ovc_result.verification.recommendation} | Discrepancies: {ovc_result.observation.discrepancies}"
-            }
-
-    # v0.4 — OVC-wrapped agent delegation
+    # ==================================================================
+    # v0.4.1: ALL agent execution routes through the broker
+    # ==================================================================
     def _handle_agent_task(self, user_input: str) -> str:
         agent_name, reason = self.agents.select(user_input)
         if agent_name is None:
@@ -267,50 +224,35 @@ JARVIS:"""
         print(f"  [Delegating to {agent_name}]")
         start = time.time()
 
-        # v0.4 — Extract file paths for coding agent verification
         expected_files = []
         if agent_name == "coding_agent":
             expected_files = re.findall(r'/\S+\.\w+', user_input)
 
-        # v0.4 — OVC-wrapped agent execution (critic is now mandatory inside OVC)
-        def execute_agent():
-            return self.agents.delegate(agent_name, user_input)
+        agent_instance = self.agents.agents.get(agent_name)
+        if not agent_instance:
+            return f"Agent {agent_name} not available."
 
-        ovc_result = self.ovc.execute(
-            action_type="agent",
-            action_name=agent_name,
-            description=user_input,
-            execute_fn=execute_agent,
-            expected={"file_paths": expected_files, "success": True}
+        result = self.broker.execute_agent(
+            agent_name=agent_name,
+            task=user_input,
+            agent_instance=agent_instance,
+            expected_files=expected_files
         )
 
-        result = {
-            "success": ovc_result.final_success,
-            "result": ovc_result.action_record.actual_result.get("result", "")
-            if isinstance(ovc_result.action_record.actual_result, dict)
-            else str(ovc_result.action_record.actual_result)
-        }
         agent_output = result.get("result", "")
+        if isinstance(agent_output, dict):
+            agent_output = agent_output.get("result", "")
         latency = int((time.time() - start) * 1000)
 
-        # Track rejections in world state
-        if not ovc_result.final_success:
+        if not result.get("success"):
             self.world_state.user.add_rejection(user_input)
 
-        # v0.4 — Learn from any discrepancies (including critic rejections)
         self._check_procedural_learning()
 
-        # v0.4 — Critic is now handled INSIDE the OVC loop, not post-hoc
-        if ovc_result.critic_verdict == "REJECT":
-            self.evolution.log_action("agent", agent_name, False, latency, "Rejected by critic (OVC gate)", user_input)
-            return "I need to reconsider that approach. Let me try again."
-        elif ovc_result.critic_verdict == "NEEDS_FIX":
-            self.evolution.log_action("agent", agent_name, False, latency, "Needs fix per critic (OVC gate)", user_input)
-            fix_prompt = f"""{JARVIS_PERSONA}\n\nOriginal task: {user_input}\n\nFirst attempt had issues per critic review.\n\nProvide a corrected response.\n\nUser: {user_input}\nJARVIS:"""
-            agent_output = self.llm.generate(fix_prompt, system=JARVIS_PERSONA)
-            result["result"] = agent_output
-        else:
-            self.evolution.log_action("agent", agent_name, True, latency, "", user_input)
+        self.evolution.log_action(
+            "agent", agent_name, result.get("success", False),
+            latency, result.get("recommendation", ""), user_input
+        )
 
         self.memory.log_message("user", user_input, tool_call=f"delegate:{agent_name}")
         synthesis_prompt = f"""{JARVIS_PERSONA}\n\nYou delegated to {agent_name}. Result:\n{agent_output}\n\nRespond naturally. Summarize what was accomplished. Be concise.\n\nUser: {user_input}\nJARVIS:"""
@@ -320,7 +262,9 @@ JARVIS:"""
         self._notify_dashboard("flare_state", {"state": "normal"})
         return final
 
-    # v0.5 — Replanning-aware autonomous execution
+    # ==================================================================
+    # v0.5: Autonomous planning with replanning
+    # ==================================================================
     def _handle_autonomous(self, goal: str) -> str:
         self._notify_dashboard("flare_burst", {"intensity": "high", "reason": "autonomous_plan"})
         print(f"\n  [Autonomous Planning: {goal}]")
@@ -330,7 +274,6 @@ JARVIS:"""
         for t in tasks:
             print(f"    Step {t.id}: {t.description} ({t.agent})")
 
-        # v0.5 — Execute with replanning on failure
         result = self._execute_plan_with_replanning(goal, tasks)
 
         if self.current_project:
@@ -342,8 +285,10 @@ JARVIS:"""
         final = self.llm.generate(synth, system=JARVIS_PERSONA)
         self._extract_facts(goal, final)
 
-        # v0.5 — Extract knowledge graph entities from the plan result
-        self.knowledge_graph.extract_from_text(result["summary"], self.llm)
+        try:
+            self.knowledge_graph.extract_from_text(result["summary"], self.llm)
+        except Exception:
+            pass
 
         self._notify_dashboard("flare_state", {"state": "normal"})
         return final
@@ -383,52 +328,35 @@ JARVIS:"""
             )
 
             start = time.time()
-            ovc_result = None
+            result = {"success": False, "result": "No execution performed"}
 
-            if self.ovc and task.agent in ("tool", "coding_agent", "research_agent",
-                                            "business_agent", "creative_agent", "llm"):
-                if task.agent == "tool":
-                    def execute_step():
-                        full = f"{context}\n\nCurrent task: {task.description}" if context else task.description
-                        return self.planner._execute_tool_task(full)
-                    ovc_result = self.ovc.execute(
-                        action_type="plan_step", action_name="tool",
-                        description=task.description, execute_fn=execute_step,
-                        expected={"success": True}
+            # v0.4.1: Route ALL plan steps through the broker
+            if task.agent == "tool":
+                full_desc = f"{context}\n\nCurrent task: {task.description}" if context else task.description
+                tool_call = self._task_to_tool_call(full_desc)
+                if tool_call:
+                    result = self.broker.execute_tool(
+                        tool_call,
+                        description=task.description,
+                        project_id=self.current_project
                     )
-                    result = {"success": ovc_result.final_success,
-                              "result": str(ovc_result.action_record.actual_result)}
-                elif task.agent in self.agents.agents:
-                    def execute_step():
-                        full = f"{context}\n\nYour task: {task.description}" if context else task.description
-                        return self.agents.delegate(task.agent, full)
-                    ovc_result = self.ovc.execute(
-                        action_type="plan_step", action_name=task.agent,
-                        description=task.description, execute_fn=execute_step,
-                        expected={"success": True}
-                    )
-                    result = {"success": ovc_result.final_success,
-                              "result": str(ovc_result.action_record.actual_result)}
                 else:
-                    full = f"{context}\n\nNow do this: {task.description}" if context else task.description
-                    result = {"success": True, "result": self.llm.generate(full)}
+                    result = {"success": False, "result": "Could not convert task to tool call"}
+            elif task.agent in self.agents.agents:
+                full = f"{context}\n\nYour task: {task.description}" if context else task.description
+                agent_instance = self.agents.agents[task.agent]
+                result = self.broker.execute_agent(
+                    agent_name=task.agent,
+                    task=full,
+                    agent_instance=agent_instance
+                )
             else:
-                try:
-                    if task.agent == "tool":
-                        full = f"{context}\n\nCurrent task: {task.description}" if context else task.description
-                        result = self.planner._execute_tool_task(full)
-                    elif task.agent in self.agents.agents:
-                        full = f"{context}\n\nYour task: {task.description}" if context else task.description
-                        result = self.agents.delegate(task.agent, full)
-                    else:
-                        full = f"{context}\n\nNow do this: {task.description}" if context else task.description
-                        result = {"success": True, "result": self.llm.generate(full)}
-                except Exception as e:
-                    result = {"success": False, "result": str(e)}
+                full = f"{context}\n\nNow do this: {task.description}" if context else task.description
+                result = {"success": True, "result": self.llm.generate(full)}
 
             latency = int((time.time() - start) * 1000)
             task.status = "done" if result.get("success") else "failed"
-            task.result = result.get("result", "")
+            task.result = str(result.get("result", ""))
 
             if self.world_state:
                 self.world_state.update_plan_step(task.id, "done" if result.get("success") else "failed")
@@ -440,9 +368,9 @@ JARVIS:"""
                 i += 1
             else:
                 failed.append(task)
-                discrepancies = []
-                if ovc_result:
-                    discrepancies = ovc_result.observation.discrepancies
+                discrepancies = result.get("ovc", {}).get("discrepancies", [])
+                if not discrepancies and not result.get("success"):
+                    discrepancies = [result.get("result", "Unknown failure")]
 
                 recovery_plan, analysis = self.replanner.execute_recovery(
                     goal, task, result, discrepancies,
@@ -497,13 +425,28 @@ JARVIS:"""
             "summary": self.planner._summarize(completed, failed)
         }
 
+    def _task_to_tool_call(self, description: str) -> Dict[str, Any]:
+        """Convert a natural language task to a tool call JSON."""
+        prompt = f'Convert this task to a tool call JSON: {description}\nFormat: {{"tool": "name", "params": {{"key": "value"}}}}\nJSON:'
+        raw = self.llm.generate(prompt, max_tokens=500)
+        try:
+            return json.loads(raw.strip())
+        except json.JSONDecodeError:
+            return None
+
+    # ==================================================================
+    # v0.4.1: Vision routed through ModelRouter, not hardcoded Ollama
+    # ==================================================================
     def _handle_vision(self, user_input: str) -> str:
-        """Handle vision requests directly."""
         if "vision" not in self.tools:
             return "Vision tool not available. Install a vision model: ollama pull llava"
+
         query = user_input.replace("look", "").replace("see", "").replace("what do you", "").strip() or "Describe what you see."
         print("  [Capturing screen...]")
+
+        # Use the vision tool directly (it handles its own model via ModelRouter now)
         result = self.tools["vision"].run(mode="screen", query=query)
+
         if result.get("success"):
             self.memory.log_message("user", user_input, tool_call="vision", tool_result=result["result"][:200])
             self.memory.log_message("jarvis", result["result"], tool_call="vision")
@@ -511,6 +454,9 @@ JARVIS:"""
         else:
             return f"Vision failed: {result.get('result')}"
 
+    # ==================================================================
+    # Command handlers
+    # ==================================================================
     def _handle_command(self, user_input: str) -> bool:
         cmd = user_input.lower().strip()
 
@@ -587,7 +533,6 @@ JARVIS:"""
             print(self.evolution.get_insights())
             return True
 
-        # v0.5 — Model routing stats
         if cmd == "routing":
             stats = self.model_router.get_stats()
             print(f"  Routing Stats:")
@@ -599,7 +544,6 @@ JARVIS:"""
             print(f"    Available backends: {', '.join(stats['backends_available'])}")
             return True
 
-        # v0.4 — Procedural memory commands
         if cmd == "rules":
             rules = self.procedural_memory.get_all_rules()
             if rules:
@@ -618,7 +562,6 @@ JARVIS:"""
                 print(f"  Rule {rule_id} not found.")
             return True
 
-        # v0.5 — Scheduler commands
         if cmd == "jobs":
             jobs = self.scheduler.list_jobs()
             if jobs:
@@ -669,7 +612,6 @@ JARVIS:"""
                 print(f"  Job {job_id} not found")
             return True
 
-        # v0.5 — Knowledge Graph commands
         if cmd.startswith("kg add "):
             rest = user_input[7:].strip()
             m = re.match(r'(.+?)\s+is\s+a\s+(.+)', rest, re.I)
@@ -714,7 +656,6 @@ JARVIS:"""
             print(summary)
             return True
 
-        # v0.5 — Temporal / Deadline commands
         if cmd.startswith("deadline "):
             rest = user_input[9:].strip()
             expr = self.temporal.parse(rest)
@@ -741,26 +682,22 @@ JARVIS:"""
             self._notify_dashboard("flare_state", {"state": "normal"})
             return ""
 
-        # Vision shortcuts
         vision_triggers = ["look", "what do you see", "what is on my screen", "describe my screen", "see this"]
         if any(t in user_input.lower() for t in vision_triggers):
             result = self._handle_vision(user_input)
             self._notify_dashboard("flare_state", {"state": "normal"})
             return result
 
-        # Autonomous planning
         if user_input.lower().startswith("plan "):
             result = self._handle_autonomous(user_input[5:].strip())
             self._notify_dashboard("flare_state", {"state": "normal"})
             return result
 
-        # Agent delegation
         agent_response = self._handle_agent_task(user_input)
         if agent_response is not None:
             self._notify_dashboard("flare_state", {"state": "normal"})
             return agent_response
 
-        # Normal tool/direct flow
         prompt = self._build_prompt(user_input)
         raw_response = self.llm.generate(prompt, system=JARVIS_PERSONA)
 
@@ -785,7 +722,6 @@ JARVIS:"""
             self.memory.log_message("jarvis", final_response, tool_call=tool_call["tool"])
             self._extract_facts(user_input, final_response)
 
-            # v0.5 — Extract knowledge graph entities from conversation
             try:
                 self.knowledge_graph.extract_from_text(
                     f"User: {user_input}\nJARVIS: {final_response}",
@@ -801,7 +737,6 @@ JARVIS:"""
             self.memory.log_message("jarvis", raw_response)
             self._extract_facts(user_input, raw_response)
 
-            # v0.5 — Extract knowledge graph entities from conversation
             try:
                 self.knowledge_graph.extract_from_text(
                     f"User: {user_input}\nJARVIS: {raw_response}",
