@@ -22,7 +22,16 @@ class MockLLM:
 
 
 def test_coding_agent():
-    agent = CodingAgent(MockLLM())
+    # Provide a mock broker to satisfy the new broker requirement
+    class MockBroker:
+        def __init__(self):
+            self.calls = []
+        def execute_tool(self, tool_call):
+            self.calls.append(tool_call)
+            # Simplified execution: always succeed with empty result
+            return {"success": True, "result": "mocked"}
+
+    agent = CodingAgent(MockLLM(), broker=MockBroker())
     result = agent.run("Build a hello world script")
     assert result['success']
     assert "Built:" in result['result']

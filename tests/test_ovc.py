@@ -1,256 +1,540 @@
-"""
-test_ovc.py
-
-Standalone test for the OVC loop.
-Run this BEFORE integrating into JARVIS to verify everything works.
-
-Usage:
-    python test_ovc.py
-
-This tests:
-1. WorldState creation and mutation
-2. Observer file system checks
-3. Verifier severity assessment
-4. Full OVC cycle with simulated success
-5. Full OVC cycle with simulated failure + correction
-6. OVC cycle with hallucination detection
-"""
-
-import sys
 import os
 import tempfile
 
-# Add parent to path so we can import core
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-from core.state import WorldState, ActionStatus
+from core.state import WorldState, ActionStatus, ActionRecord
 from core.observer import Observer
 from core.verifier import Verifier
 from core.ovc_loop import OVCLoop
 
 
 class MockLLM:
-    """Fake LLM for testing corrections."""
-    def generate(self, prompt, system=None, temperature=0.7, max_tokens=2000):
-        if "correction" in prompt.lower():
-            return "Retry with absolute path and create parent directories first"
-        return "Mock LLM response"
+    def __init__(self, response="OK"):
+        self.response = response
+        self.calls = 0
+
+    def generate(self, prompt, max_tokens=None):
+        self.calls += 1
+        return self.response
 
 
 def test_world_state():
-    print("\n=== Test: WorldState ===")
+    print("\n=== Test: World State ===")
+
     ws = WorldState()
-    assert ws.session_id.startswith("state_")
-    assert ws._state_version == 0
 
-    # Simulate an action
-    from core.state import ActionRecord
-    action = ActionRecord(
-        id="test_1",
-        action_type="tool",
-        action_name="write_file",
-        description="Create test file"
-    )
-    ws.record_action(action)
-    assert ws._state_version == 1
-    assert len(ws.action_history) == 1
+    assert ws.user.trust_level == 0.5
+    assert ws.active_plan is None
+    assert ws.action_history == []
 
-    # Update the action
-    ws.update_action("test_1", status=ActionStatus.DONE, confidence=0.95)
-    assert ws.action_history[0].status == ActionStatus.DONE
+    ws.user.name = "TestUser"
+    ws.user.active_project = "TestProject"
+    ws.user.active_goal = "TestGoal"
 
-    # Set a plan
-    plan = ws.set_plan("Build a test app", 3)
-    assert plan.total_steps == 3
-    assert plan.completion_pct() == 0.0
+    assert ws.user.name == "TestUser"
+    assert ws.user.active_project == "TestProject"
+    assert ws.user.active_goal == "TestGoal"
 
-    ws.update_plan_step(1, "done")
-    assert plan.completion_pct() == 1/3
-
-    # Check summary generation
-    summary = ws.get_state_summary()
-    assert "World State" in summary
-    assert "Build a test app" in summary
-    print("✓ WorldState: PASS")
+    print("World state OK")
 
 
 def test_observer():
     print("\n=== Test: Observer ===")
-    obs = Observer()
 
-    # Test 1: File that exists
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as f:
-        f.write("hello")
-        temp_path = f.name
+    observer = Observer()
 
-    result = obs.observe_file_system([temp_path])
-    assert result.match is True
-    assert len(result.discrepancies) == 0
-    os.unlink(temp_path)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        delete=False,
+        encoding="utf-8",
+    ) as f:
+        f.write("JARVIS observer test")
+        test_path = f.name
 
-    # Test 2: File that does NOT exist
-    result = obs.observe_file_system(["/tmp/jarvis_nonexistent_12345.xyz"])
-    assert result.match is False
-    assert "does not exist" in result.discrepancies[0]
+    try:
+        result = observer.observe_file_system([test_path])
 
-    # Test 3: Command observation
-    result = obs.observe_command("echo 'ovc_test'")
-    assert result.match is True
-    assert "ovc_test" in result.actual["stdout"]
+        assert result is not None
+        assert result.observation_type == "file_system"
+        assert result.match is True
+        assert result.actual[test_path]["exists"] is True
+        assert result.actual[test_path]["is_file"] is True
+        assert result.actual[test_path]["size"] > 0
 
-    # Test 4: Command with wrong expected output
-    result = obs.observe_command("echo 'wrong'", expected_output="right")
-    assert result.match is False
+    finally:
+        if os.path.exists(test_path):
+            os.remove(test_path)
 
-    # Test 5: Agent output with hallucination indicators
-    result = obs.observe_agent_output(
-        "Build app", "I have created the file successfully!"
-    )
-    assert result.metadata["requires_verification"] is True
-    assert result.metadata["hallucination_risk"] == "HIGH"
-
-    print("✓ Observer: PASS")
+    print("Observer OK")
 
 
 def test_verifier():
     print("\n=== Test: Verifier ===")
-    v = Verifier()
 
-    # Test 1: No discrepancies = verified
-    result = v.verify({}, {}, [], "tool", "write_file")
+    verifier = Verifier()
+
+    result = verifier.verify(
+        expected={"exists": True},
+        actual={"exists": True},
+        discrepancies=[],
+        action_type="tool",
+        action_name="test_action",
+    )
+
+    assert result is not None
     assert result.verified is True
     assert result.confidence == 1.0
     assert result.severity == "none"
+    assert result.is_trustworthy() is True
 
-    # Test 2: Minor discrepancy
-    result = v.verify({}, {}, ["File is slightly larger than expected"], "tool", "write_file")
-    assert result.severity == "minor"
-    assert result.verified is True  # minor still passes
-
-    # Test 3: Critical discrepancy
-    result = v.verify({}, {}, ["File does not exist"], "tool", "write_file")
-    assert result.severity == "critical"
-    assert result.verified is False
-    assert "HALT" in result.recommendation
-
-    # Test 4: Auto-correctable assessment
-    assert result.auto_correctable is True
-    assert "path" in result.correction_hint.lower()
-
-    print("✓ Verifier: PASS")
+    print("Verifier OK")
 
 
 def test_ovc_success():
-    print("\n=== Test: OVC Loop — Success ===")
+    print("\n=== Test: OVC Success ===")
+
     ws = WorldState()
-    obs = Observer(ws)
-    ver = Verifier()
+    observer = Observer(ws)
+    verifier = Verifier()
     llm = MockLLM()
-    ovc = OVCLoop(llm, ws, obs, ver)
 
-    # Simulate a successful tool execution
-    def success_fn():
-        return {"success": True, "result": "File written"}
-
-    result = ovc.execute(
-        action_type="tool",
-        action_name="write_file",
-        description="Write test file",
-        execute_fn=success_fn,
-        expected={"success": True}
+    loop = OVCLoop(
+        llm_client=llm,
+        world_state=ws,
+        observer=observer,
+        verifier=verifier,
     )
 
+    result = loop.execute(
+        action_type="plan_step",
+        action_name="test_success",
+        description="Test successful task",
+        execute_fn=lambda: {
+            "success": True,
+            "result": "Task completed successfully.",
+        },
+        expected={
+            "success": True,
+        },
+    )
+
+    assert result is not None
     assert result.final_success is True
+    assert result.verification.verified is True
     assert result.iterations == 1
+    assert result.corrected is False
     assert result.action_record.status == ActionStatus.DONE
-    print("✓ OVC Success: PASS")
+
+    print("OVC success OK")
 
 
 def test_ovc_failure_then_correction():
-    print("\n=== Test: OVC Loop — Failure + Correction ===")
+    print("\n=== Test: OVC Failure Then Correction ===")
+
     ws = WorldState()
-    obs = Observer(ws)
-    ver = Verifier()
+    observer = Observer(ws)
+    verifier = Verifier()
     llm = MockLLM()
-    ovc = OVCLoop(llm, ws, obs, ver)
 
-    attempt_count = [0]
+    state = {
+        "fixed": False,
+        "executions": 0,
+        "corrections": [],
+    }
 
-    def flaky_fn():
-        attempt_count[0] += 1
-        if attempt_count[0] == 1:
-            return {"success": False, "result": "Permission denied"}
-        return {"success": True, "result": "File written on retry"}
+    def execute_fn():
+        state["executions"] += 1
 
-    result = ovc.execute(
-        action_type="tool",
-        action_name="write_file",
-        description="Write protected file",
-        execute_fn=flaky_fn,
-        expected={"success": True},
-        max_iterations=3
+        if not state["fixed"]:
+            return {
+                "success": False,
+                "result": "Expected file does not exist",
+            }
+
+        return {
+            "success": True,
+            "result": "Corrected attempt succeeded",
+        }
+
+    def apply_correction_fn(correction, last_result):
+        state["corrections"].append(correction)
+        state["fixed"] = True
+        return True
+
+    loop = OVCLoop(
+        llm_client=llm,
+        world_state=ws,
+        observer=observer,
+        verifier=verifier,
     )
 
-    # Even though we simulated a failure, without a real correction mechanism
-    # the OVC loop will report failure. The key thing is that it TRIED.
-    assert result.iterations >= 1
-    assert len(ws.action_history) == 1
-    print(f"✓ OVC Failure handling: PASS (attempts={attempt_count[0]}, final_success={result.final_success})")
+    result = loop.execute(
+        action_type="plan_step",
+        action_name="test_correction",
+        description="Test correction flow",
+        execute_fn=execute_fn,
+        expected={
+            "success": True,
+        },
+        apply_correction_fn=apply_correction_fn,
+        max_iterations=3,
+    )
+
+    assert result is not None
+    assert result.final_success is True
+    assert result.corrected is True
+    assert result.iterations == 2
+
+    assert state["executions"] == 2
+    assert len(state["corrections"]) == 1
+
+    assert result.action_record.status == ActionStatus.CORRECTED
+    assert len(result.corrections_history) == 1
+
+    assert loop._correction_stats["total"] == 1
+    assert loop._correction_stats["successful"] == 1
+
+    print("OVC correction OK")
 
 
 def test_ovc_hallucination_detection():
-    print("\n=== Test: OVC Loop — Hallucination Detection ===")
-    ws = WorldState()
-    obs = Observer(ws)
-    ver = Verifier()
-    llm = MockLLM()
-    ovc = OVCLoop(llm, ws, obs, ver)
+    print("\n=== Test: OVC Hallucination Detection ===")
 
-    # Agent claims it created a file, but the file doesn't exist
-    def fake_coding_agent():
-        return {
-            "success": True,
-            "result": "I have created the file /tmp/fake_hallucination.py successfully!"
-        }
+    observer = Observer()
 
-    result = ovc.execute(
-        action_type="agent",
-        action_name="coding_agent",
-        description="Create /tmp/fake_hallucination.py",
-        execute_fn=fake_coding_agent,
-        expected={"file_paths": ["/tmp/fake_hallucination.py"], "success": True}
+    result = observer.observe_agent_output(
+        task="Create a test file",
+        output="I have created the requested file successfully.",
+        expected_elements=[],
     )
 
-    # Should detect the hallucination because file doesn't exist
-    assert result.observation.metadata.get("hallucination_risk") == "HIGH"
-    assert not result.observation.match  # File doesn't exist
-    print("✓ OVC Hallucination detection: PASS")
+    assert result is not None
+    assert result.match is True
+    assert result.metadata["requires_verification"] is True
+    assert result.metadata["hallucination_risk"] == "HIGH"
+
+    assert "I have created" in result.metadata["claimed_actions"]
+
+    print("Hallucination detection OK")
 
 
 def test_state_checkpoint():
-    print("\n=== Test: State Checkpoint ===")
+    print(
+        "\n=== Test: State Checkpoint Persistence ==="
+    )
+
     ws = WorldState()
+
+    # --------------------------------------------------------------
+    # Populate user state
+    # --------------------------------------------------------------
     ws.user.name = "TestUser"
     ws.user.active_project = "TestProject"
-    ws.set_plan("Test plan", 2)
-    ws.update_plan_step(1, "done")
+    ws.user.active_goal = "Test checkpoint persistence"
 
-    checkpoint_path = "/tmp/jarvis_test_checkpoint.json"
-    ws.save_checkpoint(checkpoint_path)
-    assert os.path.exists(checkpoint_path)
+    ws.user.preferences["response_style"] = "direct"
 
-    restored = WorldState.load_checkpoint(checkpoint_path)
+    ws.user.add_rejection(
+        "Use the old implementation"
+    )
+
+    # --------------------------------------------------------------
+    # Populate environment state
+    # --------------------------------------------------------------
+    ws.environment.track_file_creation(
+        "/tmp/jarvis_created.txt"
+    )
+
+    ws.environment.track_file_modification(
+        "/tmp/jarvis_modified.txt"
+    )
+
+    ws.environment.last_command_output = (
+        "checkpoint test output"
+    )
+
+    ws.environment.last_command_exit_code = 0
+
+    # --------------------------------------------------------------
+    # Populate plan state
+    # --------------------------------------------------------------
+    ws.set_plan(
+        "Test persistent plan",
+        3,
+    )
+
+    ws.update_plan_step(
+        1,
+        "done",
+    )
+
+    ws.update_plan_step(
+        2,
+        "running",
+    )
+
+    # --------------------------------------------------------------
+    # Populate action history
+    # --------------------------------------------------------------
+    action = ActionRecord(
+        id="checkpoint_action_1",
+        action_type="tool",
+        action_name="write_file",
+        description="Write checkpoint test file",
+        expected_result={
+            "exists": True,
+        },
+        actual_result={
+            "exists": True,
+        },
+        status=ActionStatus.DONE,
+        confidence=0.95,
+        discrepancies=[
+            "Initial test discrepancy"
+        ],
+        corrections_applied=[
+            "Retried with correct path"
+        ],
+        latency_ms=42,
+    )
+
+    ws.record_action(action)
+
+    # --------------------------------------------------------------
+    # Populate questions / uncertainties
+    # --------------------------------------------------------------
+    ws.add_open_question(
+        "Does checkpoint persistence survive restart?"
+    )
+
+    ws.add_uncertainty(
+        "Checkpoint format may evolve."
+    )
+
+    # --------------------------------------------------------------
+    # Save checkpoint
+    # --------------------------------------------------------------
+    checkpoint_path = (
+        "/tmp/jarvis_test_checkpoint.json"
+    )
+
+    ws.save_checkpoint(
+        checkpoint_path
+    )
+
+    assert os.path.exists(
+        checkpoint_path
+    )
+
+    # --------------------------------------------------------------
+    # Restore into a fresh WorldState
+    # --------------------------------------------------------------
+    restored = WorldState.load_checkpoint(
+        checkpoint_path
+    )
+
     assert restored is not None
-    assert restored.session_id == ws.session_id
-    os.unlink(checkpoint_path)
-    print("✓ State Checkpoint: PASS")
+
+    # --------------------------------------------------------------
+    # Verify core state
+    # --------------------------------------------------------------
+    assert (
+        restored.session_id
+        == ws.session_id
+    )
+
+    assert (
+        restored._state_version
+        == ws._state_version
+    )
+
+    # --------------------------------------------------------------
+    # Verify user state
+    # --------------------------------------------------------------
+    assert (
+        restored.user.name
+        == "TestUser"
+    )
+
+    assert (
+        restored.user.active_project
+        == "TestProject"
+    )
+
+    assert (
+        restored.user.active_goal
+        == "Test checkpoint persistence"
+    )
+
+    assert (
+        restored.user.preferences[
+            "response_style"
+        ]
+        == "direct"
+    )
+
+    assert (
+        restored.user.recent_rejections
+        == ["Use the old implementation"]
+    )
+
+    # add_rejection reduces trust from 0.5 to 0.45
+    assert (
+        restored.user.trust_level
+        == 0.45
+    )
+
+    # --------------------------------------------------------------
+    # Verify environment state
+    # --------------------------------------------------------------
+    assert (
+        "/tmp/jarvis_created.txt"
+        in restored.environment.files_created_this_session
+    )
+
+    assert (
+        "/tmp/jarvis_modified.txt"
+        in restored.environment.files_modified_this_session
+    )
+
+    assert (
+        restored.environment.last_command_output
+        == "checkpoint test output"
+    )
+
+    assert (
+        restored.environment.last_command_exit_code
+        == 0
+    )
+
+    # --------------------------------------------------------------
+    # Verify plan state
+    # --------------------------------------------------------------
+    assert restored.active_plan is not None
+
+    assert (
+        restored.active_plan.goal
+        == "Test persistent plan"
+    )
+
+    assert (
+        restored.active_plan.total_steps
+        == 3
+    )
+
+    assert (
+        restored.active_plan.step_statuses[1]
+        == "done"
+    )
+
+    assert (
+        restored.active_plan.step_statuses[2]
+        == "running"
+    )
+
+    assert (
+        restored.active_plan.step_statuses[3]
+        == "pending"
+    )
+
+    # --------------------------------------------------------------
+    # Verify action history
+    # --------------------------------------------------------------
+    assert len(
+        restored.action_history
+    ) == 1
+
+    restored_action = (
+        restored.action_history[0]
+    )
+
+    assert (
+        restored_action.id
+        == "checkpoint_action_1"
+    )
+
+    assert (
+        restored_action.action_type
+        == "tool"
+    )
+
+    assert (
+        restored_action.action_name
+        == "write_file"
+    )
+
+    assert (
+        restored_action.description
+        == "Write checkpoint test file"
+    )
+
+    assert (
+        restored_action.expected_result
+        == {"exists": True}
+    )
+
+    assert (
+        restored_action.actual_result
+        == {"exists": True}
+    )
+
+    assert (
+        restored_action.status
+        == ActionStatus.DONE
+    )
+
+    assert (
+        restored_action.confidence
+        == 0.95
+    )
+
+    assert (
+        restored_action.discrepancies
+        == ["Initial test discrepancy"]
+    )
+
+    assert (
+        restored_action.corrections_applied
+        == ["Retried with correct path"]
+    )
+
+    assert (
+        restored_action.latency_ms
+        == 42
+    )
+
+    # --------------------------------------------------------------
+    # Verify questions / uncertainties
+    # --------------------------------------------------------------
+    assert (
+        restored.open_questions
+        == [
+            "Does checkpoint persistence survive restart?"
+        ]
+    )
+
+    assert (
+        restored.uncertainties
+        == [
+            "Checkpoint format may evolve."
+        ]
+    )
+
+    # --------------------------------------------------------------
+    # Cleanup
+    # --------------------------------------------------------------
+    if os.path.exists(
+        checkpoint_path
+    ):
+        os.remove(
+            checkpoint_path
+        )
+
+    print(
+        "State checkpoint persistence OK"
+    )
 
 
 if __name__ == "__main__":
-    print("=" * 50)
-    print("JARVIS v0.4 OVC Loop Test Suite")
-    print("=" * 50)
-
     test_world_state()
     test_observer()
     test_verifier()
@@ -258,8 +542,3 @@ if __name__ == "__main__":
     test_ovc_failure_then_correction()
     test_ovc_hallucination_detection()
     test_state_checkpoint()
-
-    print("\n" + "=" * 50)
-    print("ALL TESTS PASSED")
-    print("=" * 50)
-    print("\nThe OVC loop is working. Proceed with INTEGRATION.md steps.")

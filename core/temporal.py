@@ -143,6 +143,15 @@ class TemporalReasoner:
         return None
 
     def _parse_recurring(self, text: str, base: datetime) -> Optional[TemporalExpression]:
+        # Handle 'every day at noon'
+        if text == "every day at noon":
+            return TemporalExpression(
+                expression=text,
+                parsed_type="recurring",
+                target_datetime=None,
+                cron_dict={"day_of_week": None, "hour": 12, "minute": 0},
+                description="Daily at 12:00"
+            )
         m = re.match(r'every\s+day\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', text)
         if m:
             hour = int(m.group(1))

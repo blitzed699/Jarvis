@@ -1,7 +1,6 @@
 """
-core/state.py
-
 The World State Layer — structured belief state that persists across turns.
+
 This is the 'working memory' of JARVIS's cognitive architecture.
 Without this, JARVIS is planning blind.
 """
@@ -26,17 +25,20 @@ class ActionStatus(Enum):
 @dataclass
 class ActionRecord:
     """A single action with expected vs actual outcome."""
+
     id: str
-    action_type: str          # "tool" | "agent" | "llm" | "plan_step"
+    action_type: str
     action_name: str
     description: str
     expected_result: Dict[str, Any] = field(default_factory=dict)
     actual_result: Dict[str, Any] = field(default_factory=dict)
     status: ActionStatus = ActionStatus.PENDING
-    confidence: float = 1.0   # 0.0 → 1.0
+    confidence: float = 1.0
     discrepancies: List[str] = field(default_factory=list)
     corrections_applied: List[str] = field(default_factory=list)
-    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    timestamp: str = field(
+        default_factory=lambda: datetime.now().isoformat()
+    )
     latency_ms: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
@@ -48,14 +50,20 @@ class ActionRecord:
 @dataclass
 class PlanState:
     """Mutable state of an active multi-step plan."""
+
     goal: str
     current_step_index: int = 0
     total_steps: int = 0
     step_statuses: Dict[int, str] = field(default_factory=dict)
-    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    created_at: str = field(
+        default_factory=lambda: datetime.now().isoformat()
+    )
 
     def is_complete(self) -> bool:
-        return all(s == "done" for s in self.step_statuses.values())
+        return all(
+            s == "done"
+            for s in self.step_statuses.values()
+        )
 
     def current_step_id(self) -> Optional[int]:
         for i in range(1, self.total_steps + 1):
@@ -66,17 +74,30 @@ class PlanState:
     def completion_pct(self) -> float:
         if not self.total_steps:
             return 0.0
-        done = sum(1 for s in self.step_statuses.values() if s == "done")
+
+        done = sum(
+            1
+            for s in self.step_statuses.values()
+            if s == "done"
+        )
+
         return done / self.total_steps
 
 
 @dataclass
 class EnvironmentState:
     """Snapshot of the environment JARVIS is operating in."""
+
     cwd: str = field(default_factory=os.getcwd)
-    files_created_this_session: List[str] = field(default_factory=list)
-    files_modified_this_session: List[str] = field(default_factory=list)
-    processes_started: List[Dict[str, Any]] = field(default_factory=list)
+    files_created_this_session: List[str] = field(
+        default_factory=list
+    )
+    files_modified_this_session: List[str] = field(
+        default_factory=list
+    )
+    processes_started: List[Dict[str, Any]] = field(
+        default_factory=list
+    )
     last_command_output: str = ""
     last_command_exit_code: int = 0
     available_tools: List[str] = field(default_factory=list)
@@ -104,28 +125,43 @@ class EnvironmentState:
 @dataclass
 class UserContext:
     """What JARVIS believes about the user right now."""
+
     name: Optional[str] = None
     active_project: Optional[str] = None
     active_goal: Optional[str] = None
-    recent_rejections: List[str] = field(default_factory=list)
-    preferences: Dict[str, Any] = field(default_factory=dict)
-    mood_indicators: Dict[str, float] = field(default_factory=dict)
+    recent_rejections: List[str] = field(
+        default_factory=list
+    )
+    preferences: Dict[str, Any] = field(
+        default_factory=dict
+    )
+    mood_indicators: Dict[str, float] = field(
+        default_factory=dict
+    )
     last_feedback_rating: Optional[int] = None
-    trust_level: float = 0.5   # Increases as JARVIS succeeds, drops on failure
+    trust_level: float = 0.5
 
     def add_rejection(self, approach: str) -> None:
         self.recent_rejections.append(approach)
         self.recent_rejections = self.recent_rejections[-5:]
-        self.trust_level = max(0.0, self.trust_level - 0.1)
+        self.trust_level = max(
+            0.0,
+            self.trust_level - 0.1
+        )
 
     def add_success(self) -> None:
-        self.trust_level = min(1.0, self.trust_level + 0.05)
+        self.trust_level = min(
+            1.0,
+            self.trust_level + 0.05
+        )
 
 
 class WorldState:
     """
     Structured belief state that persists across turns.
-    Replaces the ad-hoc context building in jarvis.py with a rigorous model.
+
+    Replaces the ad-hoc context building in jarvis.py
+    with a rigorous model.
     """
 
     def __init__(self):
@@ -139,60 +175,105 @@ class WorldState:
         self._state_version: int = 0
 
     def _generate_session_id(self) -> str:
-        return f"state_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{hashlib.md5(os.urandom(8)).hexdigest()[:6]}"
+        return (
+            f"state_{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
+            f"{hashlib.md5(os.urandom(8)).hexdigest()[:6]}"
+        )
 
     # ------------------------------------------------------------------
-    # Mutation methods (all increment version for change-tracking)
+    # Mutation methods
     # ------------------------------------------------------------------
-    def record_action(self, action: ActionRecord) -> ActionRecord:
+
+    def record_action(
+        self,
+        action: ActionRecord
+    ) -> ActionRecord:
         self.action_history.append(action)
         self._state_version += 1
+
         if len(self.action_history) > 50:
             self.action_history = self.action_history[-50:]
+
         return action
 
-    def update_action(self, action_id: str, **kwargs) -> Optional[ActionRecord]:
+    def update_action(
+        self,
+        action_id: str,
+        **kwargs
+    ) -> Optional[ActionRecord]:
         for action in self.action_history:
             if action.id == action_id:
                 for key, value in kwargs.items():
                     if hasattr(action, key):
                         setattr(action, key, value)
+
                 self._state_version += 1
                 return action
+
         return None
 
-    def set_plan(self, goal: str, total_steps: int) -> PlanState:
+    def set_plan(
+        self,
+        goal: str,
+        total_steps: int
+    ) -> PlanState:
         self.active_plan = PlanState(
             goal=goal,
             total_steps=total_steps,
-            step_statuses={i: "pending" for i in range(1, total_steps + 1)}
+            step_statuses={
+                i: "pending"
+                for i in range(1, total_steps + 1)
+            }
         )
+
         self._state_version += 1
         return self.active_plan
 
-    def update_plan_step(self, step_id: int, status: str) -> None:
-        if self.active_plan and step_id in self.active_plan.step_statuses:
+    def update_plan_step(
+        self,
+        step_id: int,
+        status: str
+    ) -> None:
+        if (
+            self.active_plan
+            and step_id in self.active_plan.step_statuses
+        ):
             self.active_plan.step_statuses[step_id] = status
+
             if status == "done":
                 self.user.add_success()
+
             self._state_version += 1
 
-    def add_open_question(self, question: str) -> None:
+    def add_open_question(
+        self,
+        question: str
+    ) -> None:
         if question not in self.open_questions:
             self.open_questions.append(question)
             self._state_version += 1
 
-    def resolve_question(self, question: str, answer: str = "") -> None:
+    def resolve_question(
+        self,
+        question: str,
+        answer: str = ""
+    ) -> None:
         if question in self.open_questions:
             self.open_questions.remove(question)
             self._state_version += 1
 
-    def add_uncertainty(self, uncertainty: str) -> None:
+    def add_uncertainty(
+        self,
+        uncertainty: str
+    ) -> None:
         if uncertainty not in self.uncertainties:
             self.uncertainties.append(uncertainty)
             self._state_version += 1
 
-    def resolve_uncertainty(self, uncertainty: str) -> None:
+    def resolve_uncertainty(
+        self,
+        uncertainty: str
+    ) -> None:
         if uncertainty in self.uncertainties:
             self.uncertainties.remove(uncertainty)
             self._state_version += 1
@@ -200,111 +281,243 @@ class WorldState:
     # ------------------------------------------------------------------
     # Query methods
     # ------------------------------------------------------------------
-    def get_last_action(self, action_type: Optional[str] = None) -> Optional[ActionRecord]:
+
+    def get_last_action(
+        self,
+        action_type: Optional[str] = None
+    ) -> Optional[ActionRecord]:
         if not self.action_history:
             return None
+
         if action_type:
             for action in reversed(self.action_history):
                 if action.action_type == action_type:
                     return action
+
             return None
+
         return self.action_history[-1]
 
-    def get_recent_failures(self, n: int = 5) -> List[ActionRecord]:
-        failures = [a for a in self.action_history if a.status == ActionStatus.FAILED]
+    def get_recent_failures(
+        self,
+        n: int = 5
+    ) -> List[ActionRecord]:
+        failures = [
+            a
+            for a in self.action_history
+            if a.status == ActionStatus.FAILED
+        ]
+
         return failures[-n:]
 
-    def get_recent_corrections(self, n: int = 5) -> List[ActionRecord]:
-        corrected = [a for a in self.action_history if a.status == ActionStatus.CORRECTED]
+    def get_recent_corrections(
+        self,
+        n: int = 5
+    ) -> List[ActionRecord]:
+        corrected = [
+            a
+            for a in self.action_history
+            if a.status == ActionStatus.CORRECTED
+        ]
+
         return corrected[-n:]
 
-    def get_action_by_id(self, action_id: str) -> Optional[ActionRecord]:
-        for a in self.action_history:
-            if a.id == action_id:
-                return a
+    def get_action_by_id(
+        self,
+        action_id: str
+    ) -> Optional[ActionRecord]:
+        for action in self.action_history:
+            if action.id == action_id:
+                return action
+
         return None
 
-    def get_recurring_discrepancy_pattern(self) -> Optional[str]:
-        """Detect if the same failure keeps happening (for procedural memory)."""
+    def get_recurring_discrepancy_pattern(
+        self
+    ) -> Optional[str]:
+        """Detect if the same failure keeps happening."""
+
         if len(self.action_history) < 3:
             return None
+
         recent = self.action_history[-10:]
         all_disc = []
-        for a in recent:
-            all_disc.extend(a.discrepancies)
+
+        for action in recent:
+            all_disc.extend(action.discrepancies)
+
         from collections import Counter
+
         counts = Counter(all_disc)
         most_common = counts.most_common(1)
-        if most_common and most_common[0][1] >= 3:
+
+        if (
+            most_common
+            and most_common[0][1] >= 3
+        ):
             return most_common[0][0]
+
         return None
 
     # ------------------------------------------------------------------
-    # Prompt formatting — this replaces the ad-hoc context in jarvis.py
+    # Prompt formatting
     # ------------------------------------------------------------------
-    def get_state_summary(self, verbose: bool = False) -> str:
-        lines = [f"## World State (v{self._state_version})"]
+
+    def get_state_summary(
+        self,
+        verbose: bool = False
+    ) -> str:
+        lines = [
+            f"## World State (v{self._state_version})"
+        ]
 
         # User context
         u = self.user
+
         lines.append("### User Context")
+
         if u.name:
             lines.append(f"- Name: {u.name}")
+
         if u.active_project:
-            lines.append(f"- Active project: {u.active_project}")
+            lines.append(
+                f"- Active project: {u.active_project}"
+            )
+
         if u.active_goal:
-            lines.append(f"- Active goal: {u.active_goal}")
+            lines.append(
+                f"- Active goal: {u.active_goal}"
+            )
+
         if u.recent_rejections:
-            lines.append(f"- Recent rejections: {u.recent_rejections[-1]}")
-        lines.append(f"- Trust level: {u.trust_level:.0%}")
+            lines.append(
+                f"- Recent rejections: "
+                f"{u.recent_rejections[-1]}"
+            )
+
+        lines.append(
+            f"- Trust level: {u.trust_level:.0%}"
+        )
 
         # Active plan
         if self.active_plan:
             p = self.active_plan
-            lines.append(f"\n### Active Plan: {p.goal}")
-            lines.append(f"- Progress: {p.completion_pct():.0%} ({p.total_steps} steps)")
+
+            lines.append(
+                f"\n### Active Plan: {p.goal}"
+            )
+
+            lines.append(
+                f"- Progress: "
+                f"{p.completion_pct():.0%} "
+                f"({p.total_steps} steps)"
+            )
+
             current = p.current_step_id()
+
             if current:
-                lines.append(f"- Current step: #{current}")
-            failed_steps = [i for i, s in p.step_statuses.items() if s == "failed"]
+                lines.append(
+                    f"- Current step: #{current}"
+                )
+
+            failed_steps = [
+                i
+                for i, s in p.step_statuses.items()
+                if s == "failed"
+            ]
+
             if failed_steps:
-                lines.append(f"- Failed steps: {failed_steps}")
+                lines.append(
+                    f"- Failed steps: {failed_steps}"
+                )
 
         # Open questions / uncertainties
         if self.open_questions:
-            lines.append("\n### ⚠ Open Questions")
-            for q in self.open_questions:
-                lines.append(f"- {q}")
-        if self.uncertainties:
-            lines.append("\n### ⚠ Uncertainties")
-            for u_text in self.uncertainties:
-                lines.append(f"- {u_text}")
+            lines.append(
+                "\n### ⚠ Open Questions"
+            )
 
-        # Recent action history (last 3)
+            for question in self.open_questions:
+                lines.append(f"- {question}")
+
+        if self.uncertainties:
+            lines.append(
+                "\n### ⚠ Uncertainties"
+            )
+
+            for uncertainty in self.uncertainties:
+                lines.append(
+                    f"- {uncertainty}"
+                )
+
+        # Recent action history
         recent = self.action_history[-3:]
+
         if recent:
-            lines.append("\n### Recent Actions")
-            for a in recent:
-                icon = "✓" if a.status == ActionStatus.DONE else "✗" if a.status == ActionStatus.FAILED else "↻" if a.status == ActionStatus.CORRECTED else "⋯"
-                lines.append(f"- {icon} [{a.action_type}:{a.action_name}] {a.description[:60]}...")
-                if a.discrepancies:
-                    lines.append(f"    ⚠ {a.discrepancies[0][:80]}")
-                if a.corrections_applied:
-                    lines.append(f"    ↻ corrected: {a.corrections_applied[-1][:60]}")
+            lines.append(
+                "\n### Recent Actions"
+            )
+
+            for action in recent:
+                icon = (
+                    "✓"
+                    if action.status == ActionStatus.DONE
+                    else "✗"
+                    if action.status == ActionStatus.FAILED
+                    else "↻"
+                    if action.status == ActionStatus.CORRECTED
+                    else "⋯"
+                )
+
+                lines.append(
+                    f"- {icon} "
+                    f"[{action.action_type}:"
+                    f"{action.action_name}] "
+                    f"{action.description[:60]}..."
+                )
+
+                if action.discrepancies:
+                    lines.append(
+                        f"    ⚠ "
+                        f"{action.discrepancies[0][:80]}"
+                    )
+
+                if action.corrections_applied:
+                    lines.append(
+                        f"    ↻ corrected: "
+                        f"{action.corrections_applied[-1][:60]}"
+                    )
 
         # Environment snapshot
         env = self.environment.snapshot()
+
         if env["files_created"]:
-            lines.append("\n### Files This Session")
-            for f in env["files_created"][-5:]:
-                lines.append(f"- {f}")
+            lines.append(
+                "\n### Files This Session"
+            )
+
+            for path in env["files_created"][-5:]:
+                lines.append(f"- {path}")
 
         if verbose:
-            lines.append(f"\n### Environment")
-            lines.append(f"- CWD: {env['cwd']}")
-            lines.append(f"- Last exit code: {env['last_exit_code']}")
+            lines.append(
+                "\n### Environment"
+            )
+
+            lines.append(
+                f"- CWD: {env['cwd']}"
+            )
+
+            lines.append(
+                f"- Last exit code: "
+                f"{env['last_exit_code']}"
+            )
 
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Serialization
+    # ------------------------------------------------------------------
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -322,30 +535,304 @@ class WorldState:
             "environment": self.environment.snapshot(),
             "active_plan": {
                 "goal": self.active_plan.goal,
-                "current_step": self.active_plan.current_step_id(),
+                "current_step": (
+                    self.active_plan.current_step_id()
+                ),
                 "step_statuses": self.active_plan.step_statuses,
-                "completion_pct": self.active_plan.completion_pct(),
+                "completion_pct": (
+                    self.active_plan.completion_pct()
+                ),
             } if self.active_plan else None,
-            "action_history": [a.to_dict() for a in self.action_history[-20:]],
+            "action_history": [
+                action.to_dict()
+                for action in self.action_history[-20:]
+            ],
             "open_questions": self.open_questions,
             "uncertainties": self.uncertainties,
         }
 
-    def save_checkpoint(self, path: str = "memory/state_checkpoint.json") -> None:
+    def save_checkpoint(
+        self,
+        path: str = "memory/state_checkpoint.json"
+    ) -> None:
         """Save state to disk for crash recovery."""
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        directory = os.path.dirname(path)
+
+        if directory:
+            os.makedirs(
+                directory,
+                exist_ok=True
+            )
+
         with open(path, "w") as f:
-            json.dump(self.to_dict(), f, indent=2, default=str)
+            json.dump(
+                self.to_dict(),
+                f,
+                indent=2,
+                default=str
+            )
 
     @classmethod
-    def load_checkpoint(cls, path: str = "memory/state_checkpoint.json") -> Optional["WorldState"]:
-        """Restore state from disk."""
+    def load_checkpoint(
+        cls,
+        path: str = "memory/state_checkpoint.json"
+    ) -> Optional["WorldState"]:
+        """Restore a WorldState from a checkpoint."""
+
         if not os.path.exists(path):
             return None
-        # Full deserialization is complex; this is a scaffold.
-        # In production you would hydrate the full object graph.
+
         with open(path, "r") as f:
             data = json.load(f)
+
         ws = cls()
-        ws.session_id = data.get("session_id", ws.session_id)
+
+        # --------------------------------------------------------------
+        # Core state
+        # --------------------------------------------------------------
+        ws.session_id = data.get(
+            "session_id",
+            ws.session_id
+        )
+
+        ws._state_version = data.get(
+            "version",
+            0
+        )
+
+        # --------------------------------------------------------------
+        # User context
+        # --------------------------------------------------------------
+        user_data = data.get(
+            "user",
+            {}
+        )
+
+        ws.user.name = user_data.get(
+            "name"
+        )
+
+        ws.user.active_project = user_data.get(
+            "active_project"
+        )
+
+        ws.user.active_goal = user_data.get(
+            "active_goal"
+        )
+
+        ws.user.recent_rejections = list(
+            user_data.get(
+                "recent_rejections",
+                []
+            )
+        )
+
+        ws.user.preferences = dict(
+            user_data.get(
+                "preferences",
+                {}
+            )
+        )
+
+        ws.user.trust_level = float(
+            user_data.get(
+                "trust_level",
+                0.5
+            )
+        )
+
+        ws.user.last_feedback_rating = user_data.get(
+            "last_feedback"
+        )
+
+        # --------------------------------------------------------------
+        # Environment state
+        # --------------------------------------------------------------
+        environment_data = data.get(
+            "environment",
+            {}
+        )
+
+        ws.environment.cwd = environment_data.get(
+            "cwd",
+            ws.environment.cwd
+        )
+
+        ws.environment.files_created_this_session = list(
+            environment_data.get(
+                "files_created",
+                []
+            )
+        )
+
+        ws.environment.files_modified_this_session = list(
+            environment_data.get(
+                "files_modified",
+                []
+            )
+        )
+
+        ws.environment.processes_started = list(
+            environment_data.get(
+                "processes",
+                []
+            )
+        )
+
+        ws.environment.last_command_output = (
+            environment_data.get(
+                "last_output",
+                ""
+            )
+        )
+
+        ws.environment.last_command_exit_code = int(
+            environment_data.get(
+                "last_exit_code",
+                0
+            )
+        )
+
+        # --------------------------------------------------------------
+        # Active plan
+        # --------------------------------------------------------------
+        plan_data = data.get(
+            "active_plan"
+        )
+
+        if plan_data:
+            step_statuses = plan_data.get(
+                "step_statuses",
+                {}
+            )
+
+            restored_step_statuses = {
+                int(step_id): status
+                for step_id, status in step_statuses.items()
+            }
+
+            ws.active_plan = PlanState(
+                goal=plan_data.get(
+                    "goal",
+                    ""
+                ),
+                current_step_index=(
+                    plan_data.get(
+                        "current_step",
+                        0
+                    ) or 0
+                ),
+                total_steps=len(
+                    restored_step_statuses
+                ),
+                step_statuses=restored_step_statuses,
+            )
+
+        # --------------------------------------------------------------
+        # Action history
+        # --------------------------------------------------------------
+        ws.action_history = []
+
+        for action_data in data.get(
+            "action_history",
+            []
+        ):
+            action_data = dict(action_data)
+
+            status_value = action_data.get(
+                "status",
+                ActionStatus.PENDING.value
+            )
+
+            try:
+                status = ActionStatus(
+                    status_value
+                )
+            except ValueError:
+                status = ActionStatus.PENDING
+
+            action = ActionRecord(
+                id=action_data.get(
+                    "id",
+                    ""
+                ),
+                action_type=action_data.get(
+                    "action_type",
+                    ""
+                ),
+                action_name=action_data.get(
+                    "action_name",
+                    ""
+                ),
+                description=action_data.get(
+                    "description",
+                    ""
+                ),
+                expected_result=dict(
+                    action_data.get(
+                        "expected_result",
+                        {}
+                    )
+                ),
+                actual_result=dict(
+                    action_data.get(
+                        "actual_result",
+                        {}
+                    )
+                ),
+                status=status,
+                confidence=float(
+                    action_data.get(
+                        "confidence",
+                        1.0
+                    )
+                ),
+                discrepancies=list(
+                    action_data.get(
+                        "discrepancies",
+                        []
+                    )
+                ),
+                corrections_applied=list(
+                    action_data.get(
+                        "corrections_applied",
+                        []
+                    )
+                ),
+                timestamp=action_data.get(
+                    "timestamp",
+                    datetime.now().isoformat()
+                ),
+                latency_ms=int(
+                    action_data.get(
+                        "latency_ms",
+                        0
+                    )
+                ),
+            )
+
+            ws.action_history.append(
+                action
+            )
+
+        ws.action_history = ws.action_history[-50:]
+
+        # --------------------------------------------------------------
+        # Questions / uncertainties
+        # --------------------------------------------------------------
+        ws.open_questions = list(
+            data.get(
+                "open_questions",
+                []
+            )
+        )
+
+        ws.uncertainties = list(
+            data.get(
+                "uncertainties",
+                []
+            )
+        )
+
         return ws

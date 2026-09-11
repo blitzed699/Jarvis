@@ -9,10 +9,22 @@ class CodingAgent(BaseAgent):
     name = "coding_agent"
     description = "Creates and debugs software. Use for: building apps, scripts, websites."
 
-    def __init__(self, llm_client):
+    def __init__(self, llm_client, broker=None):
+        """Create a coding agent.
+
+        Parameters
+        ----------
+        llm_client : any
+            The LLM client used by all agents.
+        broker : ExecutionBroker, optional
+            When provided, the agent will route all tool calls through the broker
+            instead of invoking the tools directly.  This keeps the safety and
+            OVC boundaries intact.
+        """
         self.llm = llm_client
         self.write_tool = WriteFileTool()
         self.run_tool = RunPythonTool()
+        self.broker = broker
 
     def _extract_path(self, task: str) -> str:
         """Pull a file path like /tmp/hello.py from the task text."""
@@ -98,24 +110,49 @@ class CodingAgent(BaseAgent):
         else:
             temp_path = f"/tmp/jarvis_code_{os.urandom(4).hex()}.py"
 
-        # Write file
-        self.write_tool.run(path=temp_path, content=code)
+        # Write file via broker
+        write_call = {
+            "tool": "write_file",
+            "params": {"path": temp_path, "content": code}
+        }
+        write_resp = self._broker_execute(write_call)
+        if not write_resp.get("success"):
+            # Unexpected failure – fail early
+            return {"success": False, "result": write_resp.get("result")}
 
-        # Test execution
-        test = self.run_tool.run(code=f"exec(open('{temp_path}').read())")
+        # Test execution via broker
+        run_call = {
+            "tool": "run_python",
+            "params": {"code": f"exec(open('{temp_path}').read())"}
+        }
+        test = self._broker_execute(run_call)
 
         # Fix if broken
-        if not test["success"]:
+        if not test.get("success"):
             fix_prompt = f"{persona}\n\nFix this code:\n{code}\n\nError: {test['result']}\n\nReturn only corrected code."
             raw_fix = self.llm.generate(fix_prompt, system=persona)
             code = self._clean_code(raw_fix)
-            self.write_tool.run(path=temp_path, content=code)
-            test = self.run_tool.run(code=f"exec(open('{temp_path}').read())")
+            # Re‑write the file via broker
+            self._broker_execute({"tool": "write_file", "params": {"path": temp_path, "content": code}})
+            # Re‑run via broker
+            test = self._broker_execute({"tool": "run_python", "params": {"code": f"exec(open('{temp_path}').read())"}})
 
         return {
-            "success": test["success"],
+            "success": test.get("success"),
             "result": f"Built: {task}\nFile: {temp_path}",
             "code": code,
             "file_path": temp_path,
             "test_output": test.get("result", "")
         }
+
+    # Helper for broker‑based execution
+    def _broker_execute(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
+        """Route a tool call through the broker.
+
+        This method **requires** that ``self.broker`` is set; it never falls
+        back to direct execution.  The JARVIS core injects the broker during
+        initialization, and all test construction sites provide a mock broker.
+        """
+        if not self.broker:
+            raise RuntimeError("CodingAgent._broker_execute called without a broker")
+        return self.broker.execute_tool(tool_call)

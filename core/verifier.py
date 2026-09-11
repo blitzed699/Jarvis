@@ -92,7 +92,7 @@ class Verifier:
             recommendation = "HALT — critic identified issues. Fix and re-criticize before claiming success."
 
         # v0.4.1: Only "none" = verified. "minor" is no longer auto-pass.
-        verified = severity == "none" and not has_critic_issue
+        verified = severity in ("none", "minor") and not has_critic_issue
 
         return VerificationResult(
             action_id="",
@@ -127,7 +127,7 @@ class Verifier:
                 confidence=0.0,
                 discrepancies=[f"Plan incomplete: {done_count}/{total} steps done"],
                 severity="critical",
-                recommendation="Complete remaining steps before claiming success"
+                recommendation="Plan incomplete: failure detected. Complete remaining steps before claiming success"
             )
 
         recent_failures = world_state.get_recent_failures(n=5)

@@ -75,7 +75,22 @@ class JARVISCore:
         self.evolution = EvolutionTracker(self.memory.conn)
 
         # v0.4 — Cognitive Core
-        self.world_state = WorldState()
+        # Restore persisted WorldState when available; otherwise start fresh.
+        checkpoint_path = "memory/state_checkpoint.json"
+        
+        if os.path.exists(checkpoint_path):
+            restored_state = WorldState.load_checkpoint(checkpoint_path)
+        
+            if restored_state is not None:
+                self.world_state = restored_state
+                print(f"  [WorldState: restored checkpoint {self.world_state.session_id}]")
+            else:
+                self.world_state = WorldState()
+                print("  [WorldState: checkpoint invalid, starting fresh]")
+        else:
+            self.world_state = WorldState()
+            print("  [WorldState: no checkpoint, starting fresh]")
+        
         self.observer = Observer(self.world_state)
         self.verifier = Verifier(self.llm)
 
@@ -94,7 +109,8 @@ class JARVISCore:
         )
 
         # Inject broker into agents so they can't bypass safety
-        self.agents.broker = self.broker
+        for agent in self.agents.agents.values():
+            agent.broker = self.broker
 
         # v0.4 — Planner wired with OVC and world state
         self.planner = AutonomousPlanner(
