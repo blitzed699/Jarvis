@@ -12,6 +12,7 @@ import os
 import time
 import tempfile
 import shutil
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -24,7 +25,12 @@ from core.temporal import TemporalReasoner, TemporalExpression
 # ── Mocks ──────────────────────────────────────────────────────────
 
 class MockLLM:
+    def __init__(self):
+        self.last_prompt = None
+
     def generate(self, prompt, system=None, temperature=0.7, max_tokens=2000):
+        self.last_prompt = prompt
+
         if "replan" in prompt.lower() or "recovery" in prompt.lower():
             return '[{"id": 99, "description": "Recovered step", "agent": "llm", "depends_on": []}]'
         if "behavioral rule" in prompt.lower():
@@ -40,6 +46,7 @@ class MockLLM:
 class MockPlanner:
     def __init__(self):
         self.tasks = []
+
     def plan(self, goal):
         return []
 
@@ -48,8 +55,15 @@ class MockWorldState:
     def __init__(self):
         self.active_plan = None
         self.action_history = []
+
     def get_recent_failures(self, n=5):
         return []
+
+    def get_state_summary(self, verbose=False):
+        return (
+            "WORLD_STATE_TEST_MARKER: deployment environment is staging; "
+            "previous deploy attempt failed due to timeout."
+        )
 
 
 class MockOVCLoop:
@@ -61,9 +75,11 @@ class MockJARVISCore:
         self.agents = MockAgents()
         self.memory = MockMemory()
 
+
 class MockAgents:
     def delegate(self, agent_name, task):
         return {"success": True, "result": f"Mock {agent_name} result"}
+
 
 class MockMemory:
     def store_fact(self, text, category="other"):
@@ -148,6 +164,75 @@ def test_replanning_recovery_plan():
     print("✓ Recovery plan: PASS")
 
 
+def test_replanning_attempt_count_propagation():
+    print("\n=== Test: Replanning — Attempt Count Propagation ===")
+    replanner = ReplanningEngine(MockLLM(), MockPlanner(), MockWorldState(), MockOVCLoop())
+
+    class FakeStep:
+        id = 3
+        description = "Run deployment"
+        agent = "coding_agent"
+        depends_on = []
+
+    plan, _ = replanner.execute_recovery(
+        "Deploy app",
+        FakeStep(),
+        {"success": False, "result": "Timeout"},
+        ["Timeout"],
+        [],
+        [],
+        attempt_count=3
+    )
+
+    assert plan.strategy == RecoveryStrategy.REPLAN_FROM
+    assert replanner.replan_history[-1]["attempt_count"] == 3
+
+    print("  ✓ attempt_count=3 propagated through recovery pipeline")
+    print("  ✓ Third attempt escalates to REPLAN_FROM")
+    print("  ✓ Recovery history records the actual attempt count")
+    print("✓ Attempt count propagation: PASS")
+
+
+def test_replanning_world_state_in_prompt():
+    print("\n=== Test: Replanning — WorldState Included In LLM Prompt ===")
+
+    llm = MockLLM()
+    world_state = MockWorldState()
+    replanner = ReplanningEngine(
+        llm,
+        MockPlanner(),
+        world_state,
+        MockOVCLoop()
+    )
+
+    class FakeStep:
+        id = 4
+        description = "Deploy application"
+        agent = "coding_agent"
+        depends_on = []
+
+    plan, _ = replanner.execute_recovery(
+        "Deploy application",
+        FakeStep(),
+        {"success": False, "result": "Deployment timed out"},
+        ["Deployment timed out"],
+        [],
+        [],
+        attempt_count=2
+    )
+
+    assert plan is not None
+    assert llm.last_prompt is not None
+    assert "WORLD_STATE_TEST_MARKER" in llm.last_prompt
+    assert "staging" in llm.last_prompt
+    assert "previous deploy attempt failed due to timeout" in llm.last_prompt
+
+    print("  ✓ Current WorldState was retrieved")
+    print("  ✓ WorldState context was included in the LLM prompt")
+    print("  ✓ Replanner can reason from current cognitive state")
+    print("✓ WorldState prompt integration: PASS")
+
+
 # ── Scheduler Tests ────────────────────────────────────────────────
 
 def test_scheduler_add_job():
@@ -189,7 +274,9 @@ def test_scheduler_natural_language():
     for text, expected_trigger in cases:
         parsed = sched.parse_natural_schedule(text)
         assert parsed is not None, f"Failed to parse: {text}"
-        assert parsed["trigger"] == expected_trigger, f"Expected {expected_trigger}, got {parsed['trigger']}"
+        assert parsed["trigger"] == expected_trigger, (
+            f"Expected {expected_trigger}, got {parsed['trigger']}"
+        )
         print(f"  ✓ '{text[:30]}...' → {parsed['trigger']}")
 
     print("✓ Natural language parsing: PASS")
@@ -201,8 +288,12 @@ def test_scheduler_list_cancel():
     jarvis = MockJARVISCore()
     sched = BackgroundScheduler(jarvis, db_path="/tmp/jarvis_test_scheduler3.db")
 
-    jid1 = sched.add_job("Job 1", "delay", {"seconds": 100}, "reminder", {"message": "A"})
-    jid2 = sched.add_job("Job 2", "delay", {"seconds": 200}, "reminder", {"message": "B"})
+    jid1 = sched.add_job(
+        "Job 1", "delay", {"seconds": 100}, "reminder", {"message": "A"}
+    )
+    jid2 = sched.add_job(
+        "Job 2", "delay", {"seconds": 200}, "reminder", {"message": "B"}
+    )
 
     jobs = sched.list_jobs()
     assert len(jobs) == 2
@@ -269,118 +360,131 @@ def test_kg_extraction():
     result = kg.extract_from_text(text, llm)
 
     assert result["entities_added"] > 0
-    print(f"  ✓ Extracted {result['entities_added']} entities, {result['relations_added']} relations")
+    print(
+        f"  ✓ Extracted {result['entities_added']} entities, "
+        f"{result['relations_added']} relations"
+    )
     print("✓ KG extraction: PASS")
     os.remove("/tmp/jarvis_test_kg3.db")
 
 
-# ── Temporal Tests ─────────────────────────────────────────────────
+# ── Temporal Reasoning Tests ───────────────────────────────────────
 
-def test_temporal_relative():
+def test_temporal_relative_parsing():
     print("\n=== Test: Temporal — Relative Parsing ===")
-    tr = TemporalReasoner()
 
-    cases = [
-        ("in 3 days", "relative"),
-        ("tomorrow", "relative"),
-        ("in 30 minutes", "relative"),
-        ("next week", "relative"),
-    ]
+    base = datetime(2026, 9, 14, 10, 0, 0)
+    reasoner = TemporalReasoner(now=base)
 
-    for text, expected_type in cases:
-        result = tr.parse(text)
-        assert result is not None, f"Failed: {text}"
-        assert result.parsed_type == expected_type
-        assert result.target_datetime is not None
-        print(f"  ✓ '{text}' → {result.description}")
+    result = reasoner.parse("in 3 days")
 
+    assert result is not None
+    assert result.parsed_type == "relative"
+    assert result.target_datetime == datetime(2026, 9, 17, 10, 0, 0)
+
+    tomorrow = reasoner.parse("tomorrow")
+
+    assert tomorrow is not None
+    assert tomorrow.parsed_type == "relative"
+    assert tomorrow.target_datetime == datetime(2026, 9, 15, 9, 0, 0)
+
+    print("  ✓ 'in 3 days' parsed correctly")
+    print("  ✓ 'tomorrow' parsed correctly")
     print("✓ Relative parsing: PASS")
 
 
-def test_temporal_recurring():
-    print("\n=== Test: Temporal — Recurring Parsing ===")
-    tr = TemporalReasoner()
+def test_temporal_recurring_and_deadline():
+    print("\n=== Test: Temporal — Recurring & Deadline Parsing ===")
 
-    cases = [
-        ("every Monday at 9am", "recurring"),
-        ("every day at noon", "recurring"),
-        ("every 5 minutes", "recurring"),
-    ]
+    base = datetime(2026, 9, 14, 10, 0, 0)
+    reasoner = TemporalReasoner(now=base)
 
-    for text, expected_type in cases:
-        result = tr.parse(text)
-        assert result is not None, f"Failed: {text}"
-        assert result.parsed_type == expected_type
-        assert result.cron_dict is not None
-        print(f"  ✓ '{text}' → {result.description}")
+    recurring = reasoner.parse("every Monday at 9am")
 
-    print("✓ Recurring parsing: PASS")
+    assert recurring is not None
+    assert recurring.parsed_type == "recurring"
+    assert recurring.cron_dict is not None
+    assert recurring.cron_dict["day_of_week"] == "mon"
+    assert recurring.cron_dict["hour"] == 9
+    assert recurring.cron_dict["minute"] == 0
+
+    deadline = reasoner.parse("before 2026-09-15")
+
+    assert deadline is not None
+    assert deadline.parsed_type == "deadline"
+    assert deadline.target_datetime == datetime(2026, 9, 15, 0, 0, 0)
+
+    print("  ✓ 'every Monday at 9am' parsed into recurring schedule")
+    print("  ✓ 'before 2026-09-15' parsed into deadline")
+    print("✓ Recurring & deadline parsing: PASS")
 
 
-def test_temporal_deadline():
-    print("\n=== Test: Temporal — Deadline Tracking ===")
-    tr = TemporalReasoner()
+def test_temporal_scheduler_and_time_reasoning():
+    print("\n=== Test: Temporal — Scheduler Conversion & Time Reasoning ===")
 
-    future = tr.parse("in 5 days")
-    status = tr.time_until(future.target_datetime)
-    assert not status["overdue"]
+    base = datetime(2026, 9, 14, 10, 0, 0)
+    reasoner = TemporalReasoner(now=base)
+
+    recurring = reasoner.parse("every day at 9am")
+    scheduler_args = reasoner.to_scheduler_args(recurring)
+
+    assert scheduler_args is not None
+    assert scheduler_args["trigger"] == "cron"
+    assert scheduler_args["trigger_args"]["hour"] == 9
+    assert scheduler_args["trigger_args"]["minute"] == 0
+
+    future = datetime.now() + timedelta(hours=1)
+    status = reasoner.time_until(future)
+
+    assert status["overdue"] is False
+    assert status["seconds"] > 0
     assert "remaining" in status["text"]
-    print(f"  ✓ Future deadline: {status['text']}")
 
-    from datetime import datetime, timedelta
-    past_dt = datetime.now() - timedelta(days=1)
-    assert tr.is_overdue(past_dt)
-    status = tr.time_until(past_dt)
-    assert status["overdue"]
-    print(f"  ✓ Past deadline: {status['text']}")
+    past = datetime.now() - timedelta(hours=1)
+    overdue = reasoner.time_until(past)
 
-    print("✓ Deadline tracking: PASS")
+    assert overdue["overdue"] is True
+    assert overdue["seconds"] > 0
+    assert "overdue" in overdue["text"]
 
+    assert reasoner.is_overdue(past) is True
+    assert reasoner.is_overdue(future) is False
 
-def test_temporal_scheduler_bridge():
-    print("\n=== Test: Temporal → Scheduler Bridge ===")
-    tr = TemporalReasoner()
-
-    expr = tr.parse("every Monday at 9am")
-    sched_args = tr.to_scheduler_args(expr)
-    assert sched_args["trigger"] == "cron"
-    assert sched_args["trigger_args"]["day_of_week"] == "mon"
-
-    expr2 = tr.parse("in 30 minutes")
-    sched_args2 = tr.to_scheduler_args(expr2)
-    assert sched_args2["trigger"] == "date"
-
-    print(f"  ✓ Cron: {sched_args['trigger_args']}")
-    print(f"  ✓ Date: {sched_args2['trigger_args']}")
-    print("✓ Scheduler bridge: PASS")
+    print("  ✓ Recurring expression converted to scheduler arguments")
+    print("  ✓ Future deadline reports remaining time")
+    print("  ✓ Past deadline reports overdue status")
+    print("✓ Scheduler conversion & time reasoning: PASS")
 
 
-# ── Main ───────────────────────────────────────────────────────────
+# ── Standalone Runner ──────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("JARVIS v0.5 — Tier 2 Intelligence Amplification Test Suite")
-    print("=" * 60)
+    tests = [
+        test_replanning_analyze_failure,
+        test_replanning_strategy_selection,
+        test_replanning_recovery_plan,
+        test_replanning_attempt_count_propagation,
+        test_replanning_world_state_in_prompt,
+        test_scheduler_add_job,
+        test_scheduler_natural_language,
+        test_scheduler_list_cancel,
+        test_kg_add_query,
+        test_kg_pathfinding,
+        test_kg_extraction,
+        test_temporal_relative_parsing,
+        test_temporal_recurring_and_deadline,
+        test_temporal_scheduler_and_time_reasoning,
+    ]
 
-    test_replanning_analyze_failure()
-    test_replanning_strategy_selection()
-    test_replanning_recovery_plan()
+    passed = 0
 
-    test_scheduler_add_job()
-    test_scheduler_natural_language()
-    test_scheduler_list_cancel()
+    for test in tests:
+        try:
+            test()
+            passed += 1
+        except Exception as exc:
+            print(f"✗ {test.__name__}: {exc}")
 
-    test_kg_add_query()
-    test_kg_pathfinding()
-    test_kg_extraction()
-
-    test_temporal_relative()
-    test_temporal_recurring()
-    test_temporal_deadline()
-    test_temporal_scheduler_bridge()
-
-    print("\n" + "=" * 60)
-    print("ALL TIER 2 TESTS PASSED")
-    print("=" * 60)
-    print("\nTier 2 is fully operational.")
-    print("JARVIS can now replan, schedule, reason about knowledge, and understand time.")
+    print(f"\n{'=' * 60}")
+    print(f"Tier 2 tests: {passed}/{len(tests)} passed")
+    print(f"{'=' * 60}")

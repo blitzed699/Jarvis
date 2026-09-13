@@ -1,78 +1,85 @@
 import os
 import tempfile
 import subprocess
-from typing import Optional
-
+import re
 
 class VoiceSynthesizer:
-    """JARVIS voice output. Deep, calm, composed."""
-
-    def __init__(self, enabled: bool = True):
+    def __init__(self, enabled=True):
         self.enabled = enabled
-        self.engine = None
-        self._init_engine()
-
-    def _init_engine(self):
-        if not self.enabled:
-            return
-        try:
-            import pyttsx3
-            self.engine = pyttsx3.init()
-            # JARVIS voice profile: slower, deeper
-            self.engine.setProperty('rate', 150)  # Default ~200
-            self.engine.setProperty('volume', 0.9)
-        except ImportError:
-            self.engine = None
+        self.model_path = os.path.expanduser("~/piper-voices/en_GB-alan-medium.onnx")
 
     def speak(self, text: str):
-        """Speak text aloud."""
-        if not self.enabled:
+        if not self.enabled or not text:
             return
-        
-        # Strip markdown and JSON for cleaner speech
-        clean = self._clean_text(text)
-        
-        if self.engine:
-            self.engine.say(clean)
-            self.engine.runAndWait()
+
+        clean = self._clean(text)
+        if not clean:
+            return
+
+        if os.path.exists(self.model_path):
+            self._speak_piper(clean)
         else:
-            # Fallback: use espeak or print
-            self._fallback_speak(clean)
+            print("[VOICE] Model not found")
+            self._fallback(clean)
 
-    def _clean_text(self, text: str) -> str:
-        """Remove code blocks, JSON, markdown for voice."""
-        import re
-        # Remove code blocks
+    def _clean(self, text):
         text = re.sub(r'```[\s\S]*?```', '', text)
-        # Remove inline code
         text = re.sub(r'`[^`]*`', '', text)
-        # Remove URLs
-        text = re.sub(r'https?://\S+', 'link', text)
-        # Remove JSON objects
-        text = re.sub(r'\{[^{}]*\}', '', text)
-        return text.strip()
+        text = re.sub(r'https?://\S+', 'a link', text)
+        text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+        text = re.sub(r'\*(.*?)\*', r'\1', text)
+        return re.sub(r'\s+', ' ', text).strip()
 
-    def _fallback_speak(self, text: str):
-        """Use system TTS if pyttsx3 unavailable."""
+    def _speak_piper(self, text):
         try:
-            # Try espeak (Linux)
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-                f.write(text)
-                tmp = f.name
-            subprocess.run(['espeak', '-s', '150', '-v', 'en-us', '-f', tmp], 
-                        capture_output=True, timeout=30)
-            os.unlink(tmp)
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            # Last resort: just print
-            print(f"[VOICE] {text}")
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                wav = f.name
 
-    def save_to_file(self, text: str, path: str):
-        """Save speech to audio file."""
-        if not self.engine:
-            return False
+            cmd = [
+                "piper",
+                "--model", self.model_path,
+                "--output_file", wav
+            ]
+
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True
+            )
+            proc.communicate(input=text)
+
+            # Play audio
+            played = False
+            for player in ["aplay", "paplay", "ffplay -nodisp -autoexit", "play"]:
+                try:
+                    subprocess.run(
+                        player.split() + [wav],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=True
+                    )
+                    played = True
+                    break
+                except:
+                    continue
+
+            if not played:
+                print("[VOICE] No audio player found (tried aplay, paplay, ffplay)")
+
+            os.remove(wav)
+
+        except Exception as e:
+            print("[VOICE ERROR]", e)
+            self._fallback(text)
+
+    def _fallback(self, text):
         try:
-            self.engine.save_to_file(text, path)
-            self.engine.runAndWait()
-            return True
-        except Exception:
-            return False
+            subprocess.run(
+                ["espeak", "-v", "en-gb", "-s", "140", text],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        except:
+            print("[VOICE]", text)

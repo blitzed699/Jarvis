@@ -13,7 +13,7 @@ if __name__ == "__main__":
 
     if args.dashboard:
         try:
-            from dashboard.server import set_jarvis_core, start_server
+            from Dashboard.server import set_jarvis_core, start_server
             set_jarvis_core(jarvis)
             t = threading.Thread(target=start_server, kwargs={"port": args.port}, daemon=True)
             t.start()
