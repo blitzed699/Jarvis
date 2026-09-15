@@ -186,6 +186,8 @@ Subtasks:"""
         raw_tasks = self._correct_plan(raw_tasks, goal)
 
         self.tasks = [Subtask(**t) for t in raw_tasks if isinstance(t, dict)]
+        if self.world_state:
+            self.world_state.set_plan(goal, len(self.tasks))
         return self.tasks
 
     # v0.4 — Observed execution with plan tracking and final verification
